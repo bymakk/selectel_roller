@@ -13,6 +13,7 @@ from textual.app import ComposeResult
 from textual.widgets import Button, Footer, Label, Input, Switch, Static
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 
+from ui.screens.modals import IpLimitModal, ConfirmationModal
 from ui.widgets import CustomHeader
 from app_logic.updater import UpdateManager
 from .base import BaseScreen
@@ -198,10 +199,24 @@ class SettingsScreen(BaseScreen):
         btn.disabled = False
 
         if available:
-            self.app.notify(
-                self.app._t("update_available", version=version), 
-                severity="warning"
+            # Shift from notification to modal prompt
+            should_update = await self.app.push_screen_wait(
+                ConfirmationModal(
+                    title_key="system_update_title",
+                    subtitle_text=self.app._t("update_available", version=version) + " " + self.app._t("update_confirm_msg")
+                )
             )
+            
+            if should_update:
+                self.app.notify(self.app._t("downloading_update"), severity="information")
+                success = await updater.download_update()
+                
+                if success:
+                    self.app.notify(self.app._t("applying_settings"), severity="warning")
+                    await asyncio.sleep(1.0)
+                    updater.trigger_bootstrap()
+                else:
+                    self.app.notify(self.app._t("update_failed"), severity="error")
         elif version == "error":
             self.app.notify(
                 self.app._t("update_error"), 

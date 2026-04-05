@@ -147,7 +147,8 @@ class ConfirmationModal(BaseModalScreen):
     def __init__(
         self,
         title_key: str,
-        subtitle_key: str,
+        subtitle_key: Optional[str] = None,
+        subtitle_text: Optional[str] = None,
         confirm_key: str = "confirm",
         cancel_key: str = "cancel",
         **kwargs
@@ -155,13 +156,18 @@ class ConfirmationModal(BaseModalScreen):
         super().__init__(**kwargs)
         self.title_key = title_key
         self.subtitle_key = subtitle_key
+        self.subtitle_text = subtitle_text
         self.confirm_key = confirm_key
         self.cancel_key = cancel_key
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-dialog confirmation-modal"):
             yield Label(self.app._t(self.title_key), classes="title")
-            yield Label(self.app._t(self.subtitle_key), classes="subtitle")
+            
+            # Use raw text if provided, otherwise translation key
+            sub_text = self.subtitle_text if self.subtitle_text else self.app._t(self.subtitle_key)
+            yield Label(sub_text, classes="subtitle")
+            
             with Horizontal(classes="action-row-modal"):
                 yield Button(self.app._t(self.confirm_key), id="btn-confirm", variant="primary")
                 yield Button(self.app._t(self.cancel_key), id="btn-cancel", variant="error")

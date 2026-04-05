@@ -1,5 +1,5 @@
 {
-    "version": "0.3.2",
+    "version": "0.3.3",
     "release_date": "2026-04-05",
-    "description": "Industrial Release v0.3.2 — Critical fix for the update mechanism and enhanced error reporting"
+    "description": "Industrial Release v0.3.3 — Interactive Update Deployment Flow and UI Hardening"
 }

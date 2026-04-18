@@ -8,7 +8,7 @@ PROJECT_ROOT = PACKAGE_ROOT.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
 DOTENV_PATH = PROJECT_ROOT / ".env"
 TEMP_DIR = PROJECT_ROOT / "temp"
-MISS_CHURN_JSON_PATH = TEMP_DIR / "miss-churn.json"
+MISS_CHURN_TXT_PATH = TEMP_DIR / "miss-churn.txt"
 DEFAULT_WHITELIST_PATH = PROJECT_ROOT / "whitelist.txt"
 
 

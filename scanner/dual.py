@@ -19,13 +19,21 @@ from rich.text import Text
 from .client import SelectelScannerClient
 from .config import ScannerConfig, load_scanner_config
 from .dashboard import (
+    MATCHES_PANEL_MIN_LINES,
     format_uptime,
     region_result_style,
+    regions_panel_layout_height,
     render_events,
 )
-from .ip_frequency import MissChurnSnapshot, merge_miss_churn_snapshots, render_miss_churn_table
+from .ip_frequency import (
+    MissChurnSnapshot,
+    merge_miss_churn_snapshots,
+    persist_miss_churn_text,
+    render_miss_churn_table,
+)
 from .main import SelectelScannerApp, _normalize_regions, build_settings, parse_args
 from .models import EventRecord, MatchRecord, RegionRunState, ScannerSettings
+from .rich_ui import DASHBOARD_PANEL_PADDING, DASHBOARD_TABLE_BOX, DASHBOARD_TABLE_PADDING, dashboard_console, dashboard_console_stderr
 
 
 ONLY_REGIONS = ("ru-1", "ru-2", "ru-3")
@@ -355,11 +363,12 @@ def _disabled_worker_regions_panel(label: str) -> Panel:
         title=f"Region Workers | {compact}",
         subtitle="—",
         border_style="red",
+        padding=DASHBOARD_PANEL_PADDING,
     )
 
 
 def _render_compact_regions_table(app: SelectelScannerApp) -> Table:
-    table = Table(expand=True)
+    table = Table(expand=True, box=DASHBOARD_TABLE_BOX, padding=DASHBOARD_TABLE_PADDING)
     table.add_column("Rg", style="bold", no_wrap=True)
     table.add_column("B", justify="right")
     table.add_column("In", justify="right")
@@ -393,7 +402,7 @@ def _match_sort_key(match: MatchRecord) -> tuple[str, str, str]:
 
 
 def _render_combined_matches_table(accounts: list[tuple[str, SelectelScannerApp]]) -> Table:
-    table = Table(expand=True)
+    table = Table(expand=True, box=DASHBOARD_TABLE_BOX, padding=DASHBOARD_TABLE_PADDING)
     table.add_column("Acct", style="bold")
     table.add_column("IP", style="bold green")
     table.add_column("Rg", no_wrap=True)
@@ -446,7 +455,11 @@ def _build_dual_header(slots: list[WorkerSlot]) -> Panel:
     active = [s.app for s in slots if s.app is not None]
     if not active:
         line = "Нет активных воркеров — проверьте учётные данные в .env / config"
-        return Panel(Text(line, style="bold yellow"), border_style="yellow")
+        return Panel(
+            Text(line, style="bold yellow"),
+            border_style="yellow",
+            padding=DASHBOARD_PANEL_PADDING,
+        )
     started_at = min(a.started_at for a in active)
     accounts = [(s.label, s.app) for s in slots if s.app is not None]
     _, ips_pm, _, _ = _merged_global_stats(accounts)
@@ -457,7 +470,7 @@ def _build_dual_header(slots: list[WorkerSlot]) -> Panel:
         f"Всего IP: {total_alloc}    "
         f"Удалено IP: {total_deleted}"
     )
-    return Panel(Text(line, style="bold cyan"), border_style="cyan")
+    return Panel(Text(line, style="bold cyan"), border_style="cyan", padding=DASHBOARD_PANEL_PADDING)
 
 
 def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
@@ -479,9 +492,14 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
 
     for index, slot in enumerate(slots, start=1):
         compact_label = _compact_label(slot.label)
+        region_h = (
+            regions_panel_layout_height(len(slot.app.region_states))
+            if slot.app is not None
+            else 8
+        )
         layout[f"account_{index}_workers"].split_column(
-            Layout(name=f"account_{index}_regions"),
-            Layout(name=f"account_{index}_events", size=12),
+            Layout(name=f"account_{index}_regions", size=region_h),
+            Layout(name=f"account_{index}_events", ratio=1),
         )
         if slot.app is not None:
             layout[f"account_{index}_regions"].update(
@@ -490,6 +508,7 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
                     title=f"Region Workers | {compact_label}",
                     subtitle=slot.app.project_label,
                     border_style="blue" if index == 1 else "cyan",
+                    padding=DASHBOARD_PANEL_PADDING,
                 )
             )
         else:
@@ -499,14 +518,16 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
                 render_events(slot.events),
                 title=f"Recent Events | {compact_label}",
                 border_style="magenta",
+                padding=DASHBOARD_PANEL_PADDING,
             )
         )
 
     layout["right"].split_column(
-        Layout(name="matches_pane"),
-        Layout(name="miss_churn", size=28),
+        Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
+        Layout(name="miss_churn", size=56),
     )
     _, _, miss_merged, _ = _merged_global_stats(accounts)
+    persist_miss_churn_text(miss_merged)
     layout["matches_pane"].update(
         Panel(
             _render_combined_matches_table(accounts),
@@ -516,9 +537,10 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
     )
     layout["miss_churn"].update(
         Panel(
-            render_miss_churn_table(miss_merged, max_rows=90),
+            render_miss_churn_table(miss_merged, max_rows=180),
             title="Промахи: Miss = выдачи вне whitelist по /24 (не DELETE)",
             border_style="yellow",
+            padding=DASHBOARD_PANEL_PADDING,
         )
     )
     return layout
@@ -531,7 +553,7 @@ def _print_help() -> int:
     except SystemExit as exc:
         exit_code = int(exc.code or 0)
 
-    console = Console()
+    console = dashboard_console()
     console.print()
     console.print("Second account environment variables:", style="bold")
     console.print("  SEL2_USERNAME")
@@ -605,7 +627,7 @@ async def run_async(argv: list[str] | None = None) -> int:
             env_hint_primary=False,
         )
 
-    console = Console()
+    console = dashboard_console()
     interactive_ui = bool(args.rich) or (console.is_terminal and sys.stdout.isatty())
 
     # Один заданный аккаунт — один процесс сканера с обычным Rich-дашбордом.
@@ -728,7 +750,13 @@ async def run_async(argv: list[str] | None = None) -> int:
     if interactive_ui:
         for slot in slots:
             if slot.app is not None:
-                console.print(Panel(f"{slot.label} | {slot.app.project_label}", border_style="cyan"))
+                console.print(
+                    Panel(
+                        f"{slot.label} | {slot.app.project_label}",
+                        border_style="cyan",
+                        padding=DASHBOARD_PANEL_PADDING,
+                    )
+                )
                 slot.app._print_summary()
     if errors:
         raise errors[0]
@@ -746,6 +774,6 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
-        console = Console(stderr=True)
+        console = dashboard_console_stderr()
         console.print(f"[bold red]Dual Selectel Scanner failed:[/] {exc}")
         return 1

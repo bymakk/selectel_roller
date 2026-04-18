@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from typing import Any
 
 from rich.console import Group
 from rich.layout import Layout
@@ -9,9 +10,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .ip_frequency import MissChurnSnapshot, render_miss_churn_table
+from .ip_frequency import MissChurnSnapshot, persist_miss_churn_text, render_miss_churn_table
 from .models import EventRecord, MatchRecord, RegionRunState, ScannerSettings
+from .rich_ui import DASHBOARD_PANEL_PADDING, DASHBOARD_TABLE_BOX, DASHBOARD_TABLE_PADDING
 from .whitelist import WhitelistSummary
+
+# Рамка + заголовок «Matches» + шапка таблицы + минимум 2–3 строки с IP.
+MATCHES_PANEL_MIN_LINES = 14
 
 
 def summarize_regions(regions: list[RegionRunState]) -> dict[str, int]:
@@ -44,6 +49,12 @@ def describe_project_status(
     if any(region.allocations > 0 or region.batches > 0 for region in regions):
         return "running"
     return "starting"
+
+
+def regions_panel_layout_height(num_regions: int) -> int:
+    """Высота панели Region Workers в строках Rich Layout (зависит от числа регионов ru-1 … ru-3)."""
+    n = max(0, num_regions)
+    return max(10, 7 + n)
 
 
 def region_result_style(region: RegionRunState) -> str:
@@ -82,13 +93,14 @@ def build_dashboard(
         Layout(name="left", ratio=3),
         Layout(name="right", ratio=2),
     )
+    region_h = regions_panel_layout_height(len(regions))
     layout["left"].split_column(
-        Layout(name="regions"),
-        Layout(name="events", size=14),
+        Layout(name="regions", size=region_h),
+        Layout(name="events", ratio=1),
     )
     layout["right"].split_column(
-        Layout(name="matches_pane"),
-        Layout(name="miss_churn", size=28),
+        Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
+        Layout(name="miss_churn", size=56),
     )
 
     totals = summarize_regions(regions)
@@ -104,6 +116,7 @@ def build_dashboard(
         Panel(
             Text(status_line, style="bold cyan"),
             border_style="cyan",
+            padding=DASHBOARD_PANEL_PADDING,
         )
     )
 
@@ -116,15 +129,33 @@ def build_dashboard(
             ),
             title="Region Workers",
             border_style="blue",
+            padding=DASHBOARD_PANEL_PADDING,
         )
     )
-    layout["events"].update(Panel(render_events(events), title="Recent Events", border_style="magenta"))
-    layout["matches_pane"].update(Panel(render_matches_table(matches), title="Matches", border_style="green"))
+    layout["events"].update(
+        Panel(
+            render_events(events),
+            title="Recent Events",
+            border_style="magenta",
+            padding=DASHBOARD_PANEL_PADDING,
+        )
+    )
+    layout["matches_pane"].update(
+        Panel(
+            render_matches_table(matches),
+            title="Matches",
+            border_style="green",
+            padding=DASHBOARD_PANEL_PADDING,
+        )
+    )
+    snap = miss_churn or MissChurnSnapshot(ipv4={}, other={})
+    persist_miss_churn_text(snap)
     layout["miss_churn"].update(
         Panel(
-            render_miss_churn_table(miss_churn, max_rows=90),
+            render_miss_churn_table(snap, max_rows=180),
             title="Промахи: Miss = выдачи не whitelist по /24; неудачный DELETE в Miss не входит",
             border_style="yellow",
+            padding=DASHBOARD_PANEL_PADDING,
         )
     )
     return layout
@@ -138,7 +169,7 @@ def render_regions_table(
 ) -> Table:
     alloc_u = region_alloc_unique or {}
     del_ops = region_del_ops or {}
-    table = Table(expand=True)
+    table = Table(expand=True, box=DASHBOARD_TABLE_BOX, padding=DASHBOARD_TABLE_PADDING)
     table.add_column("Region", style="bold")
     table.add_column("Batch", justify="right")
     table.add_column("In", justify="right")
@@ -177,7 +208,7 @@ def render_regions_table(
 
 
 def render_matches_table(matches: dict[str, MatchRecord]) -> Table:
-    table = Table(expand=True)
+    table = Table(expand=True, box=DASHBOARD_TABLE_BOX, padding=DASHBOARD_TABLE_PADDING)
     table.add_column("IP", style="bold green")
     table.add_column("Region")
     table.add_column("Source")

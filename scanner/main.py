@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import TextIO
 
 from rich.console import Console
+
+from .rich_ui import (
+    DASHBOARD_PANEL_PADDING,
+    DASHBOARD_TABLE_BOX,
+    DASHBOARD_TABLE_PADDING,
+    dashboard_console,
+    dashboard_console_stderr,
+)
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -53,7 +61,7 @@ class SelectelScannerApp:
         suppress_console_log: bool = False,
     ):
         self.settings = settings
-        self.console = console or Console()
+        self.console = console or dashboard_console()
         detected_interactive = self.console.is_terminal and sys.stdout.isatty()
         self.interactive = detected_interactive if interactive is None else interactive
         self.emit_console_output = emit_console_output
@@ -835,7 +843,11 @@ class SelectelScannerApp:
         await self._delete_records("cleanup", leftovers, reason="shutdown")
 
     def _print_summary(self) -> None:
-        summary = Table(title="Selectel Scanner Summary")
+        summary = Table(
+            title="Selectel Scanner Summary",
+            box=DASHBOARD_TABLE_BOX,
+            padding=DASHBOARD_TABLE_PADDING,
+        )
         summary.add_column("Metric")
         summary.add_column("Value")
         summary.add_row("Project", self.project_label)
@@ -852,7 +864,11 @@ class SelectelScannerApp:
         self.console.print(summary)
 
         if self.matches:
-            matches_table = Table(title="Matched Floating IPs")
+            matches_table = Table(
+                title="Matched Floating IPs",
+                box=DASHBOARD_TABLE_BOX,
+                padding=DASHBOARD_TABLE_PADDING,
+            )
             matches_table.add_column("IP", style="bold green")
             matches_table.add_column("Region")
             matches_table.add_column("Source")
@@ -860,7 +876,13 @@ class SelectelScannerApp:
                 matches_table.add_row(match.address, match.region, match.source)
             self.console.print(matches_table)
         else:
-            self.console.print(Panel("No whitelist matches found.", border_style="yellow"))
+            self.console.print(
+                Panel(
+                    "No whitelist matches found.",
+                    border_style="yellow",
+                    padding=DASHBOARD_PANEL_PADDING,
+                )
+            )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1096,7 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 0
     except Exception as exc:
-        console = Console(stderr=True)
+        console = dashboard_console_stderr()
         console.print(f"[bold red]Selectel Scanner failed:[/] {exc}")
         return 1
 

@@ -538,7 +538,7 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
     layout["miss_churn"].update(
         Panel(
             render_miss_churn_table(miss_merged, max_rows=180),
-            title="Промахи: Miss = выдачи вне whitelist по /24 (не DELETE)",
+            title="Выдачи вне белого списка",
             border_style="yellow",
             padding=DASHBOARD_PANEL_PADDING,
         )

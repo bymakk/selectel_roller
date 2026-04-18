@@ -153,7 +153,7 @@ def build_dashboard(
     layout["miss_churn"].update(
         Panel(
             render_miss_churn_table(snap, max_rows=180),
-            title="Промахи: Miss = выдачи не whitelist по /24; неудачный DELETE в Miss не входит",
+            title="Выдачи вне белого списка",
             border_style="yellow",
             padding=DASHBOARD_PANEL_PADDING,
         )

@@ -710,6 +710,10 @@ class SelectelScannerApp:
             return 0
 
         async def _delete_one(record: FloatingIPRecord) -> bool:
+            addr = (record.address or "").strip()
+            if record.id in self.matches or (addr and self.matcher.contains(addr)):
+                # Матчи и whitelist никогда не удаляем (в т.ч. ветка «дубликат» в _classify_allocated).
+                return False
             async with self.delete_semaphore:
                 try:
                     deleted = await self.client.delete_floating_ip(record.id)

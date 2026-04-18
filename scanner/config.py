@@ -122,6 +122,12 @@ def _apply_env_to_api(api: SelectelApiConfig, *, secondary: bool) -> None:
         if raw:
             setattr(api, field_name, raw)
     if secondary:
+        ru2 = os.getenv("SEL2_SERVER_ID_RU2", "").strip()
+        ru3 = os.getenv("SEL2_SERVER_ID_RU3", "").strip()
+        if ru2:
+            api.server_id_ru2 = ru2
+        if ru3:
+            api.server_id_ru3 = ru3
         ids = _parse_csv_env(os.getenv("SEL2_SERVER_IDS", ""))
         if ids:
             api.server_ids = ids

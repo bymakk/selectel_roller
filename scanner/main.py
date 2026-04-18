@@ -961,6 +961,10 @@ def _resolve_regions(args: argparse.Namespace, config: ScannerConfig) -> tuple[s
     if args.regions:
         return _normalize_regions(args.regions)
 
+    env1 = os.getenv("SEL1_SCANNER_REGIONS", "").strip()
+    if env1:
+        return _normalize_regions(env1.split(","))
+
     env_regions = os.getenv("SEL_SCANNER_REGIONS", "").strip()
     if env_regions:
         return _normalize_regions(env_regions.split(","))

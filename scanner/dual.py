@@ -21,7 +21,7 @@ from .dashboard import (
     render_events,
 )
 from .ip_frequency import MissChurnSnapshot, merge_miss_churn_snapshots, render_miss_churn_table
-from .main import SelectelScannerApp, build_settings, parse_args
+from .main import SelectelScannerApp, _normalize_regions, build_settings, parse_args
 from .models import MatchRecord, RegionRunState, ScannerSettings
 
 
@@ -44,6 +44,13 @@ def _select_regions(regions: tuple[str, ...]) -> tuple[str, ...]:
             "None of ru-1, ru-2, ru-3 are available in the Selectel service catalog for this project"
         )
     return selected
+
+
+def _regions_from_env_var(name: str) -> tuple[str, ...] | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return _normalize_regions(raw.split(","))
 
 
 async def _resolve_available_regions(settings: ScannerSettings) -> tuple[str, ...]:
@@ -336,10 +343,17 @@ async def run_async(argv: list[str] | None = None) -> int:
     config_accounts = config.selectel.additional_accounts
     secondary_config = config_accounts[0] if config_accounts else None
 
+    available_primary = await _resolve_available_regions(primary_settings)
+    sel1 = _regions_from_env_var("SEL1_SCANNER_REGIONS")
+
     if args.regions:
         primary_regions = primary_settings.regions
+    elif sel1 is not None:
+        primary_regions = tuple(r for r in sel1 if r in available_primary)
+        if not primary_regions:
+            primary_regions = available_primary
     else:
-        primary_regions = await _resolve_available_regions(primary_settings)
+        primary_regions = available_primary
 
     primary_settings.regions = primary_regions
     primary_settings.state_section = "account-1"
@@ -349,7 +363,19 @@ async def run_async(argv: list[str] | None = None) -> int:
         regions=primary_regions if args.regions else (),
         config_account=secondary_config,
     )
-    secondary_regions = secondary_seed.regions or await _resolve_available_regions(secondary_seed)
+
+    available_secondary = await _resolve_available_regions(secondary_seed)
+    sel2 = _regions_from_env_var("SEL2_SCANNER_REGIONS")
+
+    if args.regions:
+        secondary_regions = secondary_seed.regions
+    elif sel2 is not None:
+        secondary_regions = tuple(r for r in sel2 if r in available_secondary)
+        if not secondary_regions:
+            secondary_regions = available_secondary
+    else:
+        secondary_regions = secondary_seed.regions or available_secondary
+
     secondary_settings = _build_secondary_settings(
         primary_settings,
         regions=secondary_regions,

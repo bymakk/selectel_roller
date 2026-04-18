@@ -271,7 +271,7 @@ def _build_dual_dashboard(accounts: list[tuple[str, SelectelScannerApp]]) -> Lay
         compact_label = _compact_label(label)
         layout[f"account_{index}_workers"].split_column(
             Layout(name=f"account_{index}_regions"),
-            Layout(name=f"account_{index}_events", size=9),
+            Layout(name=f"account_{index}_events", size=12),
         )
         layout[f"account_{index}_regions"].update(
             Panel(

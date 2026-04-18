@@ -340,6 +340,7 @@ class SelectelScannerClient:
         return network_id
 
     async def delete_floating_ip(self, floating_ip_id: str) -> bool:
+        """Neutron DELETE floatingips/{id}. Политику «не трогать whitelist» обеспечивает SelectelScannerApp._delete_records."""
         try:
             region = await self._resolve_region(floating_ip_id)
         except KeyError:

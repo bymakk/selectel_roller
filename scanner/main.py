@@ -26,6 +26,18 @@ from .strategy import apply_batch_result, apply_error
 from .whitelist import DEFAULT_WHITELIST_PATH, WhitelistMatcher
 
 
+def _ip_list(records: list[FloatingIPRecord], *, limit: int = 12) -> str:
+    """Строка адресов для логов; при длинном списке обрезает хвост."""
+    if not records:
+        return "—"
+    parts = [(r.address or "?").strip() for r in records[:limit]]
+    tail = len(records) - limit
+    s = ", ".join(parts)
+    if tail > 0:
+        s += f" (+ещё {tail})"
+    return s
+
+
 class SelectelScannerApp:
     def __init__(
         self,
@@ -81,7 +93,7 @@ class SelectelScannerApp:
             region: RegionRunState(region=region, batch_size=settings.min_batch_size)
             for region in settings.regions
         }
-        self.events: deque[EventRecord] = deque(maxlen=16)
+        self.events: deque[EventRecord] = deque(maxlen=48)
         self.delete_semaphore = asyncio.Semaphore(settings.delete_concurrency)
         self.reconcile_lock = asyncio.Lock()
         self._allocation_rate_lock = asyncio.Lock()
@@ -249,7 +261,7 @@ class SelectelScannerApp:
         now = time.monotonic()
         batch = 0
         for record in records:
-            addr = record.address.strip()
+            addr = (record.address or "").strip()
             if not addr:
                 continue
             self._allocation_ip_counts[addr] = self._allocation_ip_counts.get(addr, 0) + 1
@@ -277,9 +289,10 @@ class SelectelScannerApp:
         """Промах для панели «не whitelist»: не дубликат уже учтённого match и адрес вне whitelist."""
         if record.id in self.matches:
             return False
-        if record.address.strip() in self._matched_addresses:
+        addr = (record.address or "").strip()
+        if addr in self._matched_addresses:
             return False
-        return not self.matcher.contains(record.address)
+        return not self._ip_in_whitelist(record)
 
     def _record_miss_hits(
         self,
@@ -290,7 +303,7 @@ class SelectelScannerApp:
         wr = (worker_region or "").strip()
         seen_in_batch: set[str] = set()
         for record in misses:
-            addr = record.address.strip()
+            addr = (record.address or "").strip()
             key = self._miss_stat_key(addr)
             if not key:
                 continue
@@ -352,14 +365,13 @@ class SelectelScannerApp:
                 if self.project_id:
                     self.project_label = self.settings.project_name or self.project_id
 
-            self.log("success", "Authenticated with project-scoped Selectel token")
-            self.log("info", f"Using project {self.project_label}")
+            self.log("success", f"Авторизация OK, проект: {self.project_label}")
 
             existing = await self.client.list_floating_ips(regions=set(self.settings.regions))
             existing = await self._cleanup_existing_non_matches(existing, reason="startup")
             await self._adopt_existing_inventory(existing)
             if self.unique_match_count() >= self.settings.target_count:
-                self.log("success", "Target count already satisfied by existing floating IPs")
+                self.log("success", "Цель по количеству совпадений уже достигнута существующими IP")
                 return 0
 
             workers = [asyncio.create_task(self._region_worker(region)) for region in self.settings.regions]
@@ -457,13 +469,13 @@ class SelectelScannerApp:
         preserved_non_matches = [
             record
             for record in existing_records
-            if not self.matcher.contains(record.address) and record not in cleanup_candidates
+            if not self._ip_in_whitelist(record) and record not in cleanup_candidates
         ]
 
         if preserved_non_matches:
             self.log(
                 "info",
-                f"Preserving {len(preserved_non_matches)} existing bound non-match floating IP(s)",
+                f"Старт: оставляю {len(preserved_non_matches)} привязанных «мимо» whitelist IP (есть порт/фикс. адрес)",
             )
 
         if not cleanup_candidates:
@@ -471,17 +483,23 @@ class SelectelScannerApp:
 
         self.log(
             "warning",
-            f"Deleting {len(cleanup_candidates)} existing unbound non-match floating IP(s)",
+            f"Старт: удаляю {len(cleanup_candidates)} непривязанных IP вне whitelist: {_ip_list(cleanup_candidates)}",
         )
         deleted_count = await self._delete_records("startup", cleanup_candidates, reason=reason)
         self.log(
             "info",
-            f"Startup cleanup removed {deleted_count}/{len(cleanup_candidates)} stale non-match floating IP(s)",
+            f"Старт: удалено {deleted_count} из {len(cleanup_candidates)} лишних floating IP",
         )
         return await self.client.list_floating_ips(regions=set(self.settings.regions))
 
+    def _ip_in_whitelist(self, record: FloatingIPRecord) -> bool:
+        """True, если публичный адрес floating IP попадает под сеть/адрес из whitelist.txt."""
+        addr = (record.address or "").strip()
+        return bool(addr) and self.matcher.contains(addr)
+
     def _is_existing_cleanup_candidate(self, record: FloatingIPRecord) -> bool:
-        if self.matcher.contains(record.address):
+        # Плавающий IP из whitelist.txt никогда не считаем «мусором» на старте / reconcile.
+        if self._ip_in_whitelist(record):
             return False
         return not record.port_id and not record.fixed_ip_address
 
@@ -513,12 +531,13 @@ class SelectelScannerApp:
             region_list = ", ".join(sorted({record.region for record in cleanup_candidates}))
             self.log(
                 "warning",
-                f"[reconcile] deleting {len(cleanup_candidates)} stale non-match floating IP(s) in {region_list}",
+                f"Сверка: удаляю {len(cleanup_candidates)} непривязанных IP вне whitelist ({region_list}): "
+                f"{_ip_list(cleanup_candidates)}",
             )
             deleted_count = await self._delete_records("reconcile", cleanup_candidates, reason=reason)
             self.log(
                 "info",
-                f"[reconcile] removed {deleted_count}/{len(cleanup_candidates)} stale non-match floating IP(s)",
+                f"Сверка: удалено {deleted_count} из {len(cleanup_candidates)} лишних IP",
             )
             return deleted_count
 
@@ -531,16 +550,18 @@ class SelectelScannerApp:
 
         existing_matches = 0
         for record in existing_records:
-            if self.matcher.contains(record.address):
+            if self._ip_in_whitelist(record):
                 if self._remember_match(record, source="existing"):
                     existing_matches += 1
             else:
-                self.seen_non_match_ips.add(record.address)
+                addr = (record.address or "").strip()
+                if addr:
+                    self.seen_non_match_ips.add(addr)
 
         self.match_store.save(self.matches)
         self.log(
             "info",
-            f"Inventory: {len(existing_records)} existing floating IP(s), {existing_matches} already match whitelist",
+            f"Инвентарь: всего {len(existing_records)} floating IP, из них в whitelist уже {existing_matches}",
         )
 
     async def _region_worker(self, region: str) -> None:
@@ -585,7 +606,10 @@ class SelectelScannerApp:
                     )
                     if cooldown > 0:
                         state.cooldown_until = time.monotonic() + cooldown
-                    self.log("warning", f"[{region}] no floating IPs returned by API")
+                    self.log(
+                        "warning",
+                        f"[{region}] API не вернул floating IP (пустой ответ после выдачи)",
+                    )
                     continue
 
                 self._record_allocation_batch(allocated, region)
@@ -593,6 +617,8 @@ class SelectelScannerApp:
                 for record in allocated:
                     self.owned_unmatched[record.id] = record
                     state.last_ip = record.address
+
+                self.log("info", f"[{region}] Получено IP: {_ip_list(allocated)}")
 
                 matched, misses, duplicates = self._classify_allocated(allocated)
                 for record in matched:
@@ -604,6 +630,17 @@ class SelectelScannerApp:
                 # В misses попадают и «дубликаты» уже существующих match — не в Miss /24, не в Del#, не в miss_count
                 whitelist_misses = [r for r in misses if self._is_true_whitelist_miss(r)]
                 self._record_miss_hits(whitelist_misses, worker_region=region)
+                for r in whitelist_misses:
+                    self.log(
+                        "warning",
+                        f"[{region}] Не в whitelist — удаляю {(r.address or '?').strip()}",
+                    )
+                dup_for_delete = [r for r in misses if r not in whitelist_misses]
+                if dup_for_delete:
+                    self.log(
+                        "info",
+                        f"[{region}] Удаляю служебные/дубликаты выдачи: {_ip_list(dup_for_delete)}",
+                    )
                 deleted_count = await self._delete_records(region, misses, reason="miss")
 
                 cooldown = apply_batch_result(
@@ -621,20 +658,20 @@ class SelectelScannerApp:
                 state.cooldown_until = time.monotonic() + cooldown if cooldown > 0 else 0.0
                 self.log(
                     "info",
-                    f"[{region}] batch: created={len(allocated)} matched={len(matched)} "
-                    f"whitelist_misses={len(whitelist_misses)} raw_misses={len(misses)} "
-                    f"duplicates={duplicates} deleted={deleted_count} next_batch={state.batch_size}",
+                    f"[{region}] Итог батча: выдано {len(allocated)}, в whitelist {len(matched)}, "
+                    f"мимо whitelist {len(whitelist_misses)}, удалено записей {deleted_count}, "
+                    f"след. размер батча {state.batch_size}",
                 )
 
                 if matched:
                     self.log(
                         "success",
-                        f"[{region}] matched {len(matched)} IP(s): {', '.join(record.address for record in matched)}",
+                        f"[{region}] Совпадение whitelist: {_ip_list(matched)}",
                     )
                 elif duplicates:
                     self.log(
                         "warning",
-                        f"[{region}] batch completed with {duplicates} duplicate/non-useful allocation(s)",
+                        f"[{region}] В батче только дубликаты/отбраковка ({duplicates} шт.)",
                     )
             except asyncio.CancelledError:
                 raise
@@ -649,12 +686,12 @@ class SelectelScannerApp:
                     cooldown_max=self.settings.cooldown_max,
                 )
                 state.cooldown_until = time.monotonic() + cooldown if cooldown > 0 else 0.0
-                self.log("error", f"[{region}] {error_message}")
+                self.log("error", f"[{region}] Ошибка: {error_message}")
                 try:
                     await self._reconcile_unbound_non_matches(reason="error", regions={region})
                 except Exception as reconcile_exc:
                     reconcile_message = str(reconcile_exc).strip() or type(reconcile_exc).__name__
-                    self.log("error", f"[{region}] reconcile failed: {reconcile_message}")
+                    self.log("error", f"[{region}] Сверка после ошибки не удалась: {reconcile_message}")
 
     def _classify_allocated(
         self,
@@ -666,26 +703,28 @@ class SelectelScannerApp:
         known_match_ips = set(self._matched_addresses)
 
         for record in records:
-            if record.id in self.matches or record.address in known_match_ips:
+            addr = (record.address or "").strip()
+            if record.id in self.matches or addr in known_match_ips:
                 duplicates += 1
                 misses.append(record)
                 continue
 
-            if self.matcher.contains(record.address):
+            if self._ip_in_whitelist(record):
                 matches.append(record)
-                known_match_ips.add(record.address)
+                if addr:
+                    known_match_ips.add(addr)
                 continue
 
-            if record.address in self.seen_non_match_ips:
+            if addr in self.seen_non_match_ips:
                 duplicates += 1
             else:
-                self.seen_non_match_ips.add(record.address)
+                self.seen_non_match_ips.add(addr)
             misses.append(record)
 
         return matches, misses, duplicates
 
     def _remember_match(self, record: FloatingIPRecord, source: str) -> bool:
-        addr = record.address.strip()
+        addr = (record.address or "").strip()
         if not record.id or not addr or addr in self._matched_addresses:
             return False
         match = MatchRecord.from_floating_ip(record, source=source)
@@ -706,19 +745,31 @@ class SelectelScannerApp:
         *,
         reason: str,
     ) -> int:
+        """Единственная точка вызова Neutron DELETE для floating IP. Не удаляет адреса из whitelist.txt."""
+        if not records:
+            return 0
+
+        wl_skip = [r for r in records if self._ip_in_whitelist(r)]
+        if wl_skip:
+            self.log(
+                "warning",
+                f"[{region}] Защита: не удаляю {len(wl_skip)} IP из whitelist.txt: {_ip_list(wl_skip)}",
+            )
+        records = [r for r in records if not self._ip_in_whitelist(r)]
         if not records:
             return 0
 
         async def _delete_one(record: FloatingIPRecord) -> bool:
-            addr = (record.address or "").strip()
-            if record.id in self.matches or (addr and self.matcher.contains(addr)):
-                # Матчи и whitelist никогда не удаляем (в т.ч. ветка «дубликат» в _classify_allocated).
+            if record.id in self.matches or self._ip_in_whitelist(record):
+                # Матчи и адреса из whitelist.txt никогда не удаляем (в т.ч. ветка «дубликат» в батче).
                 return False
+            addr = (record.address or "").strip()
             async with self.delete_semaphore:
                 try:
                     deleted = await self.client.delete_floating_ip(record.id)
                 except Exception as exc:
-                    self.log("error", f"[{region}] failed to delete {record.resource_ref()}: {exc}")
+                    addr = (record.address or "?").strip()
+                    self.log("error", f"[{region}] Не удалось удалить IP {addr}: {exc}")
                     return False
                 if deleted:
                     self.owned_unmatched.pop(record.id, None)
@@ -741,10 +792,10 @@ class SelectelScannerApp:
                             if self.audit:
                                 self._audit_delete_miss_hits.append(mk)
                     return True
+                addr = (record.address or "?").strip()
                 self.log(
                     "warning",
-                    f"[{region}] delete returned false for {record.resource_ref()} ({reason}) "
-                    f"— в Miss не входит (Miss только при выдаче IP; повтор DELETE возможен)",
+                    f"[{region}] DELETE не прошёл для {addr} ({reason}) — возможен повтор или уже снят",
                 )
                 return False
 
@@ -756,7 +807,10 @@ class SelectelScannerApp:
             return
 
         leftovers = list(self.owned_unmatched.values())
-        self.log("warning", f"Cleaning up {len(leftovers)} scanner-owned non-match floating IP(s)")
+        self.log(
+            "warning",
+            f"Выход: удаляю оставшиеся «мимо» IP сканера ({len(leftovers)} шт.): {_ip_list(leftovers)}",
+        )
         await self._delete_records("cleanup", leftovers, reason="shutdown")
 
     def _print_summary(self) -> None:

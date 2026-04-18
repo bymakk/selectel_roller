@@ -84,7 +84,7 @@ def build_dashboard(
     )
     layout["left"].split_column(
         Layout(name="regions"),
-        Layout(name="events", size=10),
+        Layout(name="events", size=14),
     )
     layout["right"].split_column(
         Layout(name="matches_pane"),
@@ -195,17 +195,32 @@ def render_matches_table(matches: dict[str, MatchRecord]) -> Table:
 
 def render_events(events: deque[EventRecord]) -> Group:
     if not events:
-        return Group(Text("Waiting for activity...", style="dim"))
+        return Group(Text("Ждём событий…", style="dim"))
 
+    tag_style = {
+        "info": ("INF", "cyan"),
+        "warning": ("WRN", "yellow"),
+        "error": ("ERR", "red"),
+        "success": ("OK ", "green"),
+    }
     lines = []
     for event in list(events):
-        style = {
+        msg_style = {
             "info": "white",
             "warning": "yellow",
             "error": "red",
             "success": "green",
         }.get(event.level, "white")
-        lines.append(Text.assemble((event.timestamp(), "dim"), " ", (event.message, style)))
+        tag, tstyle = tag_style.get(event.level, ("LOG", "dim"))
+        lines.append(
+            Text.assemble(
+                (event.timestamp(), "dim"),
+                " ",
+                (f"{tag}", f"bold {tstyle}"),
+                " ",
+                (event.message, msg_style),
+            )
+        )
     return Group(*lines)
 
 

@@ -30,23 +30,62 @@
 
 ## ⚙️ Запуск
 
+Рабочая директория — **корень репозитория** (там лежат `main.py`, `.env`, `whitelist.txt`).  
+**`main.py`** сам поднимает **`.venv`**, синхронизирует **`pip install -r requirements.txt`** и при необходимости перезапускается внутри venv — можно вызывать и напрямую через `python`, и через обёртки ниже.
+
+### Все ОС: напрямую
+
+Если **Python 3** в `PATH` (на Windows удобно установщик с галкой *Add python.exe to PATH* или `py` launcher):
+
 ```bash
 python main.py
 ```
 
-Из корня репозитория: **`main.py`** создаст **`.venv`**, поставит **`requirements.txt`** и перезапустится внутри venv.
-
-Справка по второму аккаунту (dual):
+Аргументы сканера передаются как обычно, например:
 
 ```bash
 python main.py --help
-```
-
-Лог в файл (пример):
-
-```bash
 python main.py --log-file temp/scanner.log
 ```
+
+### macOS и Linux — `run.sh`
+
+Скрипт переходит в каталог репозитория, при отсутствии `.venv` создаёт его и ставит зависимости, затем запускает `main.py` (с теми же аргументами, что ты передал).
+
+```bash
+chmod +x run.sh
+./run.sh
+./run.sh --help
+./run.sh --log-file temp/scanner.log
+```
+
+**Не пиши просто `run.sh`** — в zsh/bash текущая папка **не** в `PATH`, будет `command not found`. Нужно **`./run.sh`** или **`bash run.sh`**.
+
+Нужен **bash**. На Linux без `python3` в PATH поставь пакет `python3` / `python3-venv` (названия зависят от дистрибутива).
+
+### Windows — `run.bat`
+
+Двойной клик по **`run.bat`** (консоль откроется и закроется — лучше из терминала) или из **cmd** / **PowerShell**:
+
+```bat
+run.bat
+run.bat --help
+run.bat --log-file temp\scanner.log
+```
+
+Используется команда **`python`** из PATH. Если установлен только **`py`**, сначала: `py -m venv .venv`, потом снова `run.bat`, либо правь первую строку запуска на `py main.py` под себя.
+
+### Windows + WSL / Linux в контейнере
+
+В **WSL** или на сервере без GUI веди себя как на Linux: **`run.sh`** или `python3 main.py` из каталога проекта.
+
+### Сводка
+
+| ОС | Удобный вариант | Заметка |
+|----|-----------------|--------|
+| **macOS** | `./run.sh` или `python3 main.py` | `chmod +x run.sh` один раз |
+| **Linux** | `./run.sh` или `python3 main.py` | Установи `python3`, при ошибке venv — пакет `python3-venv` |
+| **Windows** | `run.bat` или `python main.py` | Путь без кириллицы в корне диска — меньше сюрпризов с кодировкой |
 
 ---
 
@@ -85,6 +124,8 @@ python main.py --log-file temp/scanner.log
 
 | Путь | Назначение |
 |------|------------|
+| `run.sh` | Обёртка запуска для **macOS / Linux** (bash). |
+| `run.bat` | Обёртка запуска для **Windows** (cmd). |
 | `whitelist.txt` | Сети/адреса для матча (по умолчанию). |
 | `temp/selectel-scanner-state.json` | Сохранённые матчи по секциям аккаунтов. |
 | `scanner/` | Код клиента Neutron, воркеры, стратегия. |

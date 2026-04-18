@@ -75,6 +75,10 @@ class SelectelScannerApp:
         # Каждый засчитанный Miss (+1 к /24 или other), в т.ч. повтор того же IP после DELETE
         self._audit_miss_increments: list[str] = []
         self.matcher = WhitelistMatcher.from_path(settings.whitelist_path)
+        try:
+            self._whitelist_mtime_ns: int | None = settings.whitelist_path.stat().st_mtime_ns
+        except OSError:
+            self._whitelist_mtime_ns = None
         self.client = SelectelScannerClient(
             username=settings.username,
             password=settings.password,
@@ -492,8 +496,25 @@ class SelectelScannerApp:
         )
         return await self.client.list_floating_ips(regions=set(self.settings.regions))
 
+    def _refresh_whitelist_if_changed(self) -> None:
+        """Подхватывает правки whitelist.txt во время работы процесса."""
+        path = self.settings.whitelist_path
+        try:
+            mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return
+        if self._whitelist_mtime_ns == mtime_ns:
+            return
+        self.matcher = WhitelistMatcher.from_path(path)
+        self._whitelist_mtime_ns = mtime_ns
+        self.log(
+            "info",
+            f"Whitelist обновлён: {self.matcher.summary.total_entries} записей",
+        )
+
     def _ip_in_whitelist(self, record: FloatingIPRecord) -> bool:
         """True, если публичный адрес floating IP попадает под сеть/адрес из whitelist.txt."""
+        self._refresh_whitelist_if_changed()
         addr = (record.address or "").strip()
         return bool(addr) and self.matcher.contains(addr)
 

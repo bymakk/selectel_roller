@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 from rich.table import Table
+
+from .paths import MISS_CHURN_JSON_PATH
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,42 @@ def merge_miss_churn_snapshots(*snapshots: MissChurnSnapshot) -> MissChurnSnapsh
         for ip, c in snap.other.items():
             other_acc[ip] = other_acc.get(ip, 0) + int(c)
     return MissChurnSnapshot(ipv4=ipv4_out, other=other_acc)
+
+
+_last_miss_churn_payload_sig: str | None = None
+
+
+def miss_churn_snapshot_to_payload(snapshot: MissChurnSnapshot) -> dict[str, object]:
+    return {
+        "ipv4": {k: [int(v[0]), str(v[1] or "")] for k, v in snapshot.ipv4.items()},
+        "other": {k: int(v) for k, v in snapshot.other.items()},
+    }
+
+
+def persist_miss_churn_snapshot(
+    snapshot: MissChurnSnapshot,
+    *,
+    path: Path | None = None,
+    source: str = "scanner",
+) -> None:
+    """Пишет объединённый список промахов в JSON под temp/ (без лишних перезаписей при том же содержимом)."""
+    global _last_miss_churn_payload_sig
+    target = path or MISS_CHURN_JSON_PATH
+    data = miss_churn_snapshot_to_payload(snapshot)
+    sig = json.dumps(data, sort_keys=True, ensure_ascii=False)
+    if sig == _last_miss_churn_payload_sig:
+        return
+    _last_miss_churn_payload_sig = sig
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "source": source,
+        "data": data,
+    }
+    target.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def render_miss_churn_table(snapshot: MissChurnSnapshot | None, *, max_rows: int = 90) -> Table:

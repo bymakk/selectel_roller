@@ -975,7 +975,7 @@ def _env_float(name: str, fallback: float) -> float:
         return fallback
 
 
-def build_settings(args: argparse.Namespace) -> ScannerSettings:
+def build_settings(args: argparse.Namespace, *, allow_incomplete_primary: bool = False) -> ScannerSettings:
     config = load_scanner_config(args.config_path)
     selectel_config = config.selectel.api
 
@@ -985,10 +985,11 @@ def build_settings(args: argparse.Namespace) -> ScannerSettings:
     project_name = _first_non_empty(args.project_name, os.getenv("SEL_PROJECT_NAME"), selectel_config.project_name)
     project_id = _first_non_empty(args.project_id, os.getenv("SEL_PROJECT_ID"), selectel_config.project_id)
 
-    if not username or not password or not account_id:
-        raise ValueError("username, password and account_id are required for Selectel Scanner")
-    if not project_name and not project_id:
-        raise ValueError("project_name or project_id is required for Selectel Scanner")
+    if not allow_incomplete_primary:
+        if not username or not password or not account_id:
+            raise ValueError("username, password and account_id are required for Selectel Scanner")
+        if not project_name and not project_id:
+            raise ValueError("project_name or project_id is required for Selectel Scanner")
 
     whitelist_path = Path(args.whitelist_path).expanduser() if args.whitelist_path else DEFAULT_WHITELIST_PATH
     state_path = (

@@ -49,11 +49,12 @@ IP, который попал в `whitelist.txt`, удаляться не дол
 
 ### Регионы
 
-Если хочешь руками задать, где крутить:
+Если хочешь руками задать, где крутить (в dual — **две** переменные, по воркеру):
 
 - `SEL1_SCANNER_REGIONS=ru-1,ru-2,ru-3`
 - `SEL2_SCANNER_REGIONS=ru-1,ru-2,ru-3`
-- `SEL_SCANNER_REGIONS=ru-1,ru-2,ru-3`
+
+Для одиночного `scanner/main.py` без `SEL1_*` можно использовать запасной `SEL_SCANNER_REGIONS` (см. `.env.example`).
 
 ### Скорость
 

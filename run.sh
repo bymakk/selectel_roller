@@ -1,24 +1,13 @@
-#!/usr/bin/env sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-cd "$SCRIPT_DIR"
-
-if command -v python3 >/dev/null 2>&1; then
-    PYTHON_CMD=python3
-elif command -v python >/dev/null 2>&1; then
-    PYTHON_CMD=python
-else
-    echo "Python 3 is required but was not found in PATH." >&2
-    exit 1
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; exit 1; }
+  python3 -m venv .venv
+  "${ROOT}/.venv/bin/python" -m pip install -q --upgrade pip
+  "${ROOT}/.venv/bin/python" -m pip install -q -r "${ROOT}/requirements.txt"
 fi
-
-if [ ! -x ".venv/bin/python" ]; then
-    echo "Creating virtual environment..."
-    "$PYTHON_CMD" -m venv .venv
-fi
-
-echo "Installing dependencies..."
-".venv/bin/python" -m pip install -r requirements.txt
-
-exec ".venv/bin/python" main.py "$@"
+exec "$PY" "${ROOT}/main.py" "$@"

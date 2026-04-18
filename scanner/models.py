@@ -21,18 +21,22 @@ class ScannerSettings:
     whitelist_path: Path
     state_path: Path
     regions: tuple[str, ...]
+    # Секция внутри JSON при общем state-файле (dual: account-1 / account-2; см. MatchStore).
+    state_section: str = "account-1"
     target_count: int = 1
-    min_batch_size: int = 8
-    max_batch_size: int = 32
-    delete_concurrency: int = 12
-    live_refresh_per_second: int = 4
-    allocation_poll_attempts: int = 6
-    allocation_poll_delay: float = 0.7
-    cooldown_base: float = 2.0
-    cooldown_max: float = 20.0
+    min_batch_size: int = 1
+    max_batch_size: int = 1
+    delete_concurrency: int = 8
+    live_refresh_per_second: int = 6
+    allocation_poll_attempts: int = 5
+    allocation_poll_delay: float = 0.45
+    cooldown_base: float = 1.2
+    cooldown_max: float = 15.0
     cleanup_on_exit: bool = True
     cleanup_existing_non_matches: bool = True
-    reconcile_interval: float = 10.0
+    reconcile_interval: float = 7.0
+    # 0 = без лимита. Скользящее окно 60 с на все регионы этого процесса (один аккаунт).
+    max_floating_ips_per_minute: int = 30
 
     def __post_init__(self) -> None:
         self.target_count = max(1, int(self.target_count))
@@ -47,6 +51,15 @@ class ScannerSettings:
         self.cleanup_on_exit = bool(self.cleanup_on_exit)
         self.cleanup_existing_non_matches = bool(self.cleanup_existing_non_matches)
         self.reconcile_interval = max(0.0, float(self.reconcile_interval))
+        self.max_floating_ips_per_minute = max(0, int(self.max_floating_ips_per_minute))
+        self.state_section = (self.state_section or "account-1").strip() or "account-1"
+
+    @property
+    def min_seconds_per_floating_ip(self) -> float | None:
+        """Минимальный средний интервал между выдачами IP при лимите (60 / cap)."""
+        if self.max_floating_ips_per_minute <= 0:
+            return None
+        return 60.0 / float(self.max_floating_ips_per_minute)
 
 
 @dataclass

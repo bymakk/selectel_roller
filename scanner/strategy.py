@@ -4,7 +4,8 @@ from .models import RegionRunState
 
 SOFT_BACKOFF_GROWTH = 1.6
 SOFT_BACKOFF_SCALE = 0.5
-SOFT_BACKOFF_MIN_SECONDS = 1.0
+# Нижняя граница шага soft-backoff (пустой ответ / дубликаты); с батчем 1 IP допустима короче, чем для пачек
+SOFT_BACKOFF_MIN_SECONDS = 0.5
 
 
 def apply_batch_result(

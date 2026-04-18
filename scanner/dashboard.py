@@ -9,7 +9,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .ip_frequency import render_miss_churn_table
+from .ip_frequency import MissChurnSnapshot, render_miss_churn_table
 from .models import EventRecord, MatchRecord, RegionRunState, ScannerSettings
 from .whitelist import WhitelistSummary
 
@@ -68,14 +68,14 @@ def build_dashboard(
     *,
     unique_ips: int = 0,
     ips_per_minute: float = 0.0,
-    miss_ip_counts: dict[str, int] | None = None,
-    delete_unique_addrs: int = 0,
+    miss_churn: MissChurnSnapshot | None = None,
+    delete_miss_ops: int = 0,
     region_alloc_unique: dict[str, int] | None = None,
-    region_del_unique: dict[str, int] | None = None,
+    region_del_ops: dict[str, int] | None = None,
 ) -> Layout:
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=5),
+        Layout(name="header", size=3),
         Layout(name="body"),
     )
     layout["body"].split_row(
@@ -92,49 +92,17 @@ def build_dashboard(
     )
 
     totals = summarize_regions(regions)
-    status = describe_project_status(
-        regions,
-        match_count=len(matches),
-        target_count=settings.target_count,
-    )
-    miss_ip_counts = miss_ip_counts or {}
     region_alloc_unique = region_alloc_unique or {}
-    region_del_unique = region_del_unique or {}
+    region_del_ops = region_del_ops or {}
+    status_line = (
+        f"Время работы: {format_uptime(started_at)}    "
+        f"IP/мин: {ips_per_minute:.1f}    "
+        f"Всего IP: {totals['allocations']}    "
+        f"Удалено IP: {totals['deleted']}"
+    )
     layout["header"].update(
         Panel(
-            Group(
-                Text(
-                    "  ".join(
-                        [
-                            f"Project: {project_label}",
-                            f"Status: {status}",
-                            f"Uptime: {format_uptime(started_at)}",
-                            f"Progress: {len(matches)}/{settings.target_count}",
-                            f"Alloc∪: {unique_ips}",
-                            f"IP/min (~60s): {ips_per_minute:.1f}",
-                            f"Del∪: {delete_unique_addrs}",
-                        ]
-                    ),
-                    style="bold cyan",
-                ),
-                Text(
-                    "  ".join(
-                        [
-                            f"Regions: {', '.join(settings.regions)}",
-                            f"In-flight: {totals['inflight']}",
-                            f"Cooldown: {totals['cooldown_regions']}",
-                            f"Errors: {totals['errors']}",
-                            f"Whitelist: {whitelist_summary.total_entries}",
-                            f"CIDR: {whitelist_summary.network_entries}",
-                            f"Single IP: {whitelist_summary.single_ip_entries}",
-                            f"Batch range: {settings.min_batch_size}-{settings.max_batch_size}",
-                            f"Alloc ops: {totals['allocations']} | Del ops: {totals['deleted']}",
-                            "Alloc∪/Del∪ = уникальные адреса по проекту; ops = число операций API (может быть больше)",
-                        ]
-                    ),
-                    style="dim",
-                ),
-            ),
+            Text(status_line, style="bold cyan"),
             border_style="cyan",
         )
     )
@@ -144,7 +112,7 @@ def build_dashboard(
             render_regions_table(
                 regions,
                 region_alloc_unique=region_alloc_unique,
-                region_del_unique=region_del_unique,
+                region_del_ops=region_del_ops,
             ),
             title="Region Workers",
             border_style="blue",
@@ -154,8 +122,8 @@ def build_dashboard(
     layout["matches_pane"].update(Panel(render_matches_table(matches), title="Matches", border_style="green"))
     layout["miss_churn"].update(
         Panel(
-            render_miss_churn_table(miss_ip_counts, max_rows=90),
-            title="Промахи (не whitelist): частота по IP и /24",
+            render_miss_churn_table(miss_churn, max_rows=90),
+            title="Промахи: Miss = выдачи не whitelist по /24; неудачный DELETE в Miss не входит",
             border_style="yellow",
         )
     )
@@ -166,10 +134,10 @@ def render_regions_table(
     regions: list[RegionRunState],
     *,
     region_alloc_unique: dict[str, int] | None = None,
-    region_del_unique: dict[str, int] | None = None,
+    region_del_ops: dict[str, int] | None = None,
 ) -> Table:
     alloc_u = region_alloc_unique or {}
-    del_u = region_del_unique or {}
+    del_ops = region_del_ops or {}
     table = Table(expand=True)
     table.add_column("Region", style="bold")
     table.add_column("Batch", justify="right")
@@ -178,7 +146,7 @@ def render_regions_table(
     table.add_column("Hits", justify="right")
     table.add_column("Miss", justify="right")
     table.add_column("Dup", justify="right")
-    table.add_column("D∪", justify="right")
+    table.add_column("Del#", justify="right")
     table.add_column("Err", justify="right")
     table.add_column("Hit%", justify="right")
     table.add_column("Cooldown", justify="right")
@@ -190,7 +158,7 @@ def render_regions_table(
         last_value = region.last_ip or region.last_error or "-"
         rid = region.region
         a_show = str(alloc_u.get(rid, region.allocations))
-        d_show = str(del_u.get(rid, region.deleted))
+        d_show = str(del_ops.get(rid, region.deleted))
         table.add_row(
             rid,
             str(region.batch_size),

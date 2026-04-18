@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .paths import resolve_config_path
+from dotenv import load_dotenv
+
+from .paths import DOTENV_PATH, resolve_config_path
 
 
 def _string_value(value: object, default: str = "") -> str:
@@ -92,7 +95,54 @@ def _build_service_config(payload: object) -> SelectelServiceConfig:
     )
 
 
+def _parse_csv_env(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _apply_env_to_api(api: SelectelApiConfig, *, secondary: bool) -> None:
+    """Подставляет секреты и идентификаторы из окружения (в т.ч. из .env)."""
+    if secondary:
+        mapping = (
+            ("username", "SEL2_USERNAME"),
+            ("password", "SEL2_PASSWORD"),
+            ("account_id", "SEL2_ACCOUNT_ID"),
+            ("project_name", "SEL2_PROJECT_NAME"),
+            ("project_id", "SEL2_PROJECT_ID"),
+        )
+    else:
+        mapping = (
+            ("username", "SEL_USERNAME"),
+            ("password", "SEL_PASSWORD"),
+            ("account_id", "SEL_ACCOUNT_ID"),
+            ("project_name", "SEL_PROJECT_NAME"),
+            ("project_id", "SEL_PROJECT_ID"),
+        )
+    for field_name, env_key in mapping:
+        raw = os.getenv(env_key, "").strip()
+        if raw:
+            setattr(api, field_name, raw)
+    if secondary:
+        ids = _parse_csv_env(os.getenv("SEL2_SERVER_IDS", ""))
+        if ids:
+            api.server_ids = ids
+    else:
+        ru2 = os.getenv("SEL_SERVER_ID_RU2", "").strip()
+        ru3 = os.getenv("SEL_SERVER_ID_RU3", "").strip()
+        if ru2:
+            api.server_id_ru2 = ru2
+        if ru3:
+            api.server_id_ru3 = ru3
+
+
+def _overlay_selectel_env(svc: SelectelServiceConfig) -> None:
+    _apply_env_to_api(svc.api, secondary=False)
+    for index, account in enumerate(svc.additional_accounts):
+        if index == 0:
+            _apply_env_to_api(account, secondary=True)
+
+
 def load_scanner_config(config_path: str | Path | None = None) -> ScannerConfig:
+    load_dotenv(DOTENV_PATH, override=False)
     path = resolve_config_path(config_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -104,4 +154,6 @@ def load_scanner_config(config_path: str | Path | None = None) -> ScannerConfig:
     if not isinstance(payload, dict):
         return ScannerConfig()
 
-    return ScannerConfig(selectel=_build_service_config(payload.get("selectel")))
+    cfg = ScannerConfig(selectel=_build_service_config(payload.get("selectel")))
+    _overlay_selectel_env(cfg.selectel)
+    return cfg

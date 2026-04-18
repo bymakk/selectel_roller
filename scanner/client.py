@@ -258,8 +258,8 @@ class SelectelScannerClient:
         region: str,
         quantity: int,
         *,
-        poll_attempts: int = 6,
-        poll_delay: float = 0.7,
+        poll_attempts: int = 5,
+        poll_delay: float = 0.45,
     ) -> list[FloatingIPRecord]:
         await self.ensure_authenticated()
         requested_count = max(1, int(quantity))
@@ -343,7 +343,7 @@ class SelectelScannerClient:
         try:
             region = await self._resolve_region(floating_ip_id)
         except KeyError:
-            return True
+            return False
         try:
             await self._request("DELETE", f"{self._neutron_url(region)}/v2.0/floatingips/{floating_ip_id}")
             self._resource_regions.pop(floating_ip_id, None)
@@ -351,7 +351,7 @@ class SelectelScannerClient:
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 self._resource_regions.pop(floating_ip_id, None)
-                return True
+                return False
             raise
 
     async def _resolve_region(self, floating_ip_id: str) -> str:

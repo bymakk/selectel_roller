@@ -6,7 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-from rich.console import Group
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -17,13 +16,11 @@ from rich.text import Text
 from .client import SelectelScannerClient
 from .config import load_scanner_config
 from .dashboard import (
-    describe_project_status,
     format_uptime,
     region_result_style,
     render_events,
-    summarize_regions,
 )
-from .ip_frequency import render_miss_churn_table
+from .ip_frequency import MissChurnSnapshot, merge_miss_churn_snapshots, render_miss_churn_table
 from .main import SelectelScannerApp, build_settings, parse_args
 from .models import MatchRecord, RegionRunState, ScannerSettings
 
@@ -69,13 +66,6 @@ async def _resolve_available_regions(settings: ScannerSettings) -> tuple[str, ..
     return regions
 
 
-def _derive_state_path(base_path: Path, suffix: str) -> Path:
-    suffix = suffix.strip("-")
-    if base_path.suffix:
-        return base_path.with_name(f"{base_path.stem}-{suffix}{base_path.suffix}")
-    return base_path.with_name(f"{base_path.name}-{suffix}")
-
-
 def _secondary_env(key: str) -> str:
     return os.getenv(f"SEL2_{key}", "").strip()
 
@@ -93,7 +83,6 @@ def _pick_secondary_value(config_value: str, env_key: str, fallback: str = "") -
 def _build_secondary_settings(
     primary_settings: ScannerSettings,
     *,
-    base_state_path: Path,
     regions: tuple[str, ...],
     config_account: object | None = None,
 ) -> ScannerSettings:
@@ -113,8 +102,7 @@ def _build_secondary_settings(
 
     if not username or not password or not account_id:
         raise ValueError(
-            "Configure selectel.additional_accounts[0] in config.json or set "
-            "SEL2_USERNAME, SEL2_PASSWORD and SEL2_ACCOUNT_ID"
+            "Задайте второй аккаунт в .env (SEL2_*) или в config.json → selectel.additional_accounts[0]"
         )
     if not project_name and not project_id:
         raise ValueError("Second account requires project_name or project_id")
@@ -126,7 +114,8 @@ def _build_secondary_settings(
         project_name=project_name,
         project_id=project_id,
         whitelist_path=primary_settings.whitelist_path,
-        state_path=_derive_state_path(base_state_path, "account-2"),
+        state_path=primary_settings.state_path,
+        state_section="account-2",
         regions=regions,
         target_count=primary_settings.target_count,
         min_batch_size=primary_settings.min_batch_size,
@@ -140,6 +129,7 @@ def _build_secondary_settings(
         cleanup_on_exit=primary_settings.cleanup_on_exit,
         cleanup_existing_non_matches=primary_settings.cleanup_existing_non_matches,
         reconcile_interval=primary_settings.reconcile_interval,
+        max_floating_ips_per_minute=primary_settings.max_floating_ips_per_minute,
     )
 
 
@@ -163,8 +153,8 @@ def _render_compact_regions_table(app: SelectelScannerApp) -> Table:
     table.add_column("B", justify="right")
     table.add_column("In", justify="right")
     table.add_column("A∪", justify="right")
-    table.add_column("H", justify="right")
-    table.add_column("D∪", justify="right")
+    table.add_column("Miss", justify="right")
+    table.add_column("Del#", justify="right")
     table.add_column("E", justify="right")
     table.add_column("Cd", justify="right")
     table.add_column("Last", overflow="fold")
@@ -178,8 +168,8 @@ def _render_compact_regions_table(app: SelectelScannerApp) -> Table:
             str(region.batch_size),
             str(region.inflight),
             str(app.unique_alloc_by_region(region.region)),
-            str(region.matches),
-            str(app.unique_deleted_miss_by_region(region.region)),
+            str(app.whitelist_miss_events_in_region(region.region)),
+            str(app.deleted_miss_ops_in_region(region.region)),
             str(region.errors),
             cooldown,
             f"[{region_result_style(region)}]{last_value}[/{region_result_style(region)}]",
@@ -216,73 +206,48 @@ def _render_combined_matches_table(accounts: list[tuple[str, SelectelScannerApp]
 
 def _merged_global_stats(
     accounts: list[tuple[str, SelectelScannerApp]],
-) -> tuple[int, float, dict[str, int], int]:
+) -> tuple[int, float, MissChurnSnapshot, int]:
     union: set[str] = set()
-    miss_merged: dict[str, int] = {}
-    del_addr_union: set[str] = set()
+    del_ops_total = 0
     ips_pm = 0.0
+    churn_snaps: list[MissChurnSnapshot] = []
     for _, app in accounts:
         union |= app.distinct_allocated_ips()
-        del_addr_union |= app.deleted_miss_address_set()
+        del_ops_total += app.deleted_miss_ops_total()
         ips_pm += app.allocations_per_minute_recent()
-        for ip, c in app.miss_ip_counts_snapshot().items():
-            miss_merged[ip] = miss_merged.get(ip, 0) + c
-    return len(union), ips_pm, miss_merged, len(del_addr_union)
+        churn_snaps.append(app.miss_churn_snapshot())
+    miss_merged = merge_miss_churn_snapshots(*churn_snaps)
+    return len(union), ips_pm, miss_merged, del_ops_total
+
+
+def _merged_region_alloc_delete_totals(accounts: list[tuple[str, SelectelScannerApp]]) -> tuple[int, int]:
+    """Сумма счётчиков RegionRunState по всем регионам и аккаунтам (выдачи / удаления в воркерах)."""
+    alloc = 0
+    deleted = 0
+    for _, app in accounts:
+        for st in app.region_states.values():
+            alloc += st.allocations
+            deleted += st.deleted
+    return alloc, deleted
 
 
 def _build_dual_header(accounts: list[tuple[str, SelectelScannerApp]]) -> Panel:
-    project_labels = ", ".join(dict.fromkeys(app.project_label for _, app in accounts))
     started_at = min(app.started_at for _, app in accounts)
-    total_matches = sum(len(app.matches) for _, app in accounts)
-    total_target = sum(app.settings.target_count for _, app in accounts)
-    unique_ips, ips_pm, _, deleted_unique = _merged_global_stats(accounts)
-    region_totals = summarize_regions(
-        [region for _, app in accounts for region in app.region_states.values()]
+    _, ips_pm, _, _ = _merged_global_stats(accounts)
+    total_alloc, total_deleted = _merged_region_alloc_delete_totals(accounts)
+    line = (
+        f"Время работы: {format_uptime(started_at)}    "
+        f"IP/мин: {ips_pm:.1f}    "
+        f"Всего IP: {total_alloc}    "
+        f"Удалено IP: {total_deleted}"
     )
-    account_statuses = [
-        f"{_compact_label(label)}: "
-        f"{describe_project_status(list(app.region_states.values()), match_count=len(app.matches), target_count=app.settings.target_count)}"
-        for label, app in accounts
-    ]
-
-    return Panel(
-        Group(
-            Text(
-                "  ".join(
-                    [
-                        f"Project: {project_labels}",
-                        f"Uptime: {format_uptime(started_at)}",
-                        f"Progress: {total_matches}/{total_target}",
-                        f"Alloc∪: {unique_ips}",
-                        f"IP/min (~60s): {ips_pm:.1f}",
-                        f"Del∪: {deleted_unique}",
-                    ]
-                ),
-                style="bold cyan",
-            ),
-            Text(
-                "  ".join(
-                    [
-                        f"Accounts: {' | '.join(account_statuses)}",
-                        f"In-flight: {region_totals['inflight']}",
-                        f"Cooldown: {region_totals['cooldown_regions']}",
-                        f"Errors: {region_totals['errors']}",
-                        f"Alloc ops: {region_totals['allocations']} | Del ops: {region_totals['deleted']}",
-                        "Alloc∪/Del∪ — уникальные адреса (глобально по двум аккаунтам); ops — операции API",
-                    ]
-                ),
-                style="dim",
-            ),
-        ),
-        title="Selectel Scanner",
-        border_style="cyan",
-    )
+    return Panel(Text(line, style="bold cyan"), border_style="cyan")
 
 
 def _build_dual_dashboard(accounts: list[tuple[str, SelectelScannerApp]]) -> Layout:
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=5),
+        Layout(name="header", size=3),
         Layout(name="body"),
     )
     layout["body"].split_row(
@@ -332,7 +297,7 @@ def _build_dual_dashboard(accounts: list[tuple[str, SelectelScannerApp]]) -> Lay
     layout["miss_churn"].update(
         Panel(
             render_miss_churn_table(miss_merged, max_rows=90),
-            title="Промахи (не whitelist): частота по IP и /24",
+            title="Промахи: Miss = выдачи вне whitelist по /24 (не DELETE)",
             border_style="yellow",
         )
     )
@@ -353,8 +318,10 @@ def _print_help() -> int:
     console.print("  SEL2_PASSWORD")
     console.print("  SEL2_ACCOUNT_ID")
     console.print("  SEL2_PROJECT_NAME or SEL2_PROJECT_ID")
-    console.print("Or configure selectel.additional_accounts[0] in config.json")
+    console.print("Or set variables in .env (see .env.example) or selectel.additional_accounts[0] in config.json")
     console.print("Optional labels: SEL1_LABEL, SEL2_LABEL")
+    console.print("  --rich-logs     — логи событий в stderr вместе с полноэкранным Rich")
+    console.print("  --log-file PATH — тот же лог в файл внутри проекта, напр. temp/scanner.log")
     return exit_code
 
 
@@ -368,7 +335,6 @@ async def run_async(argv: list[str] | None = None) -> int:
     config = load_scanner_config(args.config_path)
     config_accounts = config.selectel.additional_accounts
     secondary_config = config_accounts[0] if config_accounts else None
-    base_state_path = primary_settings.state_path
 
     if args.regions:
         primary_regions = primary_settings.regions
@@ -376,24 +342,27 @@ async def run_async(argv: list[str] | None = None) -> int:
         primary_regions = await _resolve_available_regions(primary_settings)
 
     primary_settings.regions = primary_regions
-    primary_settings.state_path = _derive_state_path(base_state_path, "account-1")
+    primary_settings.state_section = "account-1"
 
     secondary_seed = _build_secondary_settings(
         primary_settings,
-        base_state_path=base_state_path,
         regions=primary_regions if args.regions else (),
         config_account=secondary_config,
     )
     secondary_regions = secondary_seed.regions or await _resolve_available_regions(secondary_seed)
     secondary_settings = _build_secondary_settings(
         primary_settings,
-        base_state_path=base_state_path,
         regions=secondary_regions,
         config_account=secondary_config,
     )
 
     console = Console()
-    interactive = bool(args.rich) or (console.is_terminal and sys.stdout.isatty())
+    interactive_ui = bool(args.rich) or (console.is_terminal and sys.stdout.isatty())
+    rich_logs = bool(getattr(args, "rich_logs", False))
+    log_file_arg = getattr(args, "log_file", None) or None
+    emit_out = (not interactive_ui) or rich_logs or bool(log_file_arg)
+    log_err = rich_logs and interactive_ui
+    suppress_console = bool(interactive_ui and log_file_arg and not rich_logs)
     accounts = [
         (
             _account_label(primary_settings, env_key="SEL1_LABEL"),
@@ -401,8 +370,11 @@ async def run_async(argv: list[str] | None = None) -> int:
                 primary_settings,
                 console=console,
                 interactive=False,
-                emit_console_output=not interactive,
-                emit_summary=not interactive,
+                emit_console_output=emit_out,
+                emit_summary=not interactive_ui,
+                log_to_stderr=log_err,
+                log_file=log_file_arg,
+                suppress_console_log=suppress_console,
             ),
         ),
         (
@@ -411,8 +383,11 @@ async def run_async(argv: list[str] | None = None) -> int:
                 secondary_settings,
                 console=console,
                 interactive=False,
-                emit_console_output=not interactive,
-                emit_summary=not interactive,
+                emit_console_output=emit_out,
+                emit_summary=not interactive_ui,
+                log_to_stderr=log_err,
+                log_file=log_file_arg,
+                suppress_console_log=suppress_console,
             ),
         ),
     ]
@@ -421,7 +396,7 @@ async def run_async(argv: list[str] | None = None) -> int:
     results: list[object] = []
 
     try:
-        if interactive:
+        if interactive_ui:
             with Live(
                 _build_dual_dashboard(accounts),
                 console=console,
@@ -439,7 +414,7 @@ async def run_async(argv: list[str] | None = None) -> int:
         await asyncio.gather(*tasks, return_exceptions=True)
 
     errors = [result for result in results if isinstance(result, Exception)]
-    if interactive:
+    if interactive_ui:
         for label, account in accounts:
             console.print(Panel(f"{label} | {account.project_label}", border_style="cyan"))
             account._print_summary()

@@ -6,9 +6,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 CONFIG_PATH = PROJECT_ROOT / "config.json"
+DOTENV_PATH = PROJECT_ROOT / ".env"
 TEMP_DIR = PROJECT_ROOT / "temp"
-SELECTEL_RESOURCES_DIR = PROJECT_ROOT / "resources" / "selectel"
-DEFAULT_WHITELIST_PATH = SELECTEL_RESOURCES_DIR / "whitelist.txt"
+DEFAULT_WHITELIST_PATH = PROJECT_ROOT / "whitelist.txt"
 
 
 def resolve_config_path(config_path: str | Path | None = None) -> Path:

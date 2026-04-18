@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import os
 import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
+from typing import TextIO
 
 from rich.console import Console
 from rich.live import Live
@@ -16,6 +18,7 @@ from rich.table import Table
 from .client import SelectelScannerClient
 from .config import ScannerConfig, load_scanner_config
 from .dashboard import build_dashboard
+from .ip_frequency import MissChurnSnapshot, canonical_ip_address, ipv4_slash24_key
 from .models import EventRecord, FloatingIPRecord, MatchRecord, RegionRunState, ScannerSettings
 from .paths import TEMP_DIR
 from .state import MatchStore
@@ -32,6 +35,10 @@ class SelectelScannerApp:
         interactive: bool | None = None,
         emit_console_output: bool = True,
         emit_summary: bool = True,
+        audit: bool = False,
+        log_to_stderr: bool = False,
+        log_file: str | Path | None = None,
+        suppress_console_log: bool = False,
     ):
         self.settings = settings
         self.console = console or Console()
@@ -39,6 +46,22 @@ class SelectelScannerApp:
         self.interactive = detected_interactive if interactive is None else interactive
         self.emit_console_output = emit_console_output
         self.emit_summary = emit_summary
+        self.audit = bool(audit)
+        # При Rich dual: писать строки лога в stderr, чтобы не портить полноэкранный Live
+        self.log_to_stderr = bool(log_to_stderr)
+        # Dual + Rich + --log-file без --rich-logs: писать только в файл, не в stdout
+        self.suppress_console_log = bool(suppress_console_log)
+        self._log_file_handle: TextIO | None = None
+        if log_file:
+            lp = Path(log_file).expanduser()
+            lp.parent.mkdir(parents=True, exist_ok=True)
+            self._log_file_handle = lp.open("a", encoding="utf-8")
+        # Аудит: полные канонические IP для сверки с подсчётами (вкл. только audit=True)
+        self._audit_alloc_events: list[str] = []
+        self._audit_unique_alloc: set[str] = set()
+        self._audit_delete_miss_hits: list[str] = []
+        # Каждый засчитанный Miss (+1 к /24 или other), в т.ч. повтор того же IP после DELETE
+        self._audit_miss_increments: list[str] = []
         self.matcher = WhitelistMatcher.from_path(settings.whitelist_path)
         self.client = SelectelScannerClient(
             username=settings.username,
@@ -48,9 +71,10 @@ class SelectelScannerApp:
             project_id=settings.project_id,
             regions=settings.regions,
         )
-        self.match_store = MatchStore(settings.state_path)
+        self.match_store = MatchStore(settings.state_path, section=settings.state_section)
         self.persisted_matches = self.match_store.load()
         self.matches: dict[str, MatchRecord] = {}
+        self._matched_addresses: set[str] = set()
         self.owned_unmatched: dict[str, FloatingIPRecord] = {}
         self.seen_non_match_ips: set[str] = set()
         self.region_states = {
@@ -60,24 +84,78 @@ class SelectelScannerApp:
         self.events: deque[EventRecord] = deque(maxlen=16)
         self.delete_semaphore = asyncio.Semaphore(settings.delete_concurrency)
         self.reconcile_lock = asyncio.Lock()
+        self._allocation_rate_lock = asyncio.Lock()
+        self._allocation_rate_times: deque[float] = deque()
         self.stop_event = asyncio.Event()
         self.started_at = time.monotonic()
         self.project_id = settings.project_id
         self.project_label = settings.project_name or settings.project_id or "project-scoped"
         # Статистика по выданным IP (каждое появление в батче считается отдельно)
         self._allocation_ip_counts: dict[str, int] = {}
-        self._miss_ip_counts: dict[str, int] = {}
+        # Промахи: адрес вне whitelist учитывается один раз, пока не удалён; после успешного DELETE снова может дать +1 к /24
+        self._miss_ips_counted: set[str] = set()
+        self._miss_ipv4_by_net: dict[str, dict[str, str | int]] = defaultdict(
+            lambda: {"events": 0, "first_ip": ""}
+        )
+        self._miss_other: defaultdict[str, int] = defaultdict(int)
         self._rate_samples: deque[tuple[float, int]] = deque()
-        # Успешные DELETE по промахам — уникальные адреса (глобально и по региону)
-        self._deleted_miss_addresses: set[str] = set()
+        # Успешные DELETE по промахам: каждое удаление +1 (не дедуп по адресу)
+        self._deleted_miss_ops: int = 0
         self._alloc_addrs_by_region: dict[str, set[str]] = defaultdict(set)
-        self._deleted_miss_addrs_by_region: dict[str, set[str]] = defaultdict(set)
+        self._deleted_miss_ops_by_region: dict[str, int] = defaultdict(int)
+        # Засчитанные промахи по региону (повтор после удаления IP снова +1)
+        self._whitelist_miss_events_by_region: dict[str, int] = defaultdict(int)
 
     def unique_allocated_ip_count(self) -> int:
         return len(self._allocation_ip_counts)
 
     def total_allocation_events(self) -> int:
         return sum(self._allocation_ip_counts.values())
+
+    async def _allocation_rate_reserve(self, planned: int) -> None:
+        """Резервирует слоты скользящего окна 60 с до вызова allocate (лимит на весь аккаунт, все регионы)."""
+        cap = self.settings.max_floating_ips_per_minute
+        if cap <= 0 or planned <= 0:
+            return
+        window = 60.0
+        async with self._allocation_rate_lock:
+            while True:
+                now = time.monotonic()
+                while self._allocation_rate_times and self._allocation_rate_times[0] <= now - window:
+                    self._allocation_rate_times.popleft()
+                if len(self._allocation_rate_times) + planned <= cap:
+                    for _ in range(planned):
+                        self._allocation_rate_times.append(now)
+                    return
+                wait = self._allocation_rate_times[0] + window - now
+                await asyncio.sleep(max(wait, 0.001))
+
+    async def _allocation_rate_finalize(self, planned: int, actual: int) -> None:
+        """После allocate: убрать неиспользованный резерв или добавить слоты, если вернули больше planned."""
+        cap = self.settings.max_floating_ips_per_minute
+        if cap <= 0:
+            return
+        if actual < planned:
+            async with self._allocation_rate_lock:
+                for _ in range(planned - actual):
+                    if self._allocation_rate_times:
+                        self._allocation_rate_times.pop()
+            return
+        if actual <= planned:
+            return
+        extra = actual - planned
+        window = 60.0
+        async with self._allocation_rate_lock:
+            while True:
+                now = time.monotonic()
+                while self._allocation_rate_times and self._allocation_rate_times[0] <= now - window:
+                    self._allocation_rate_times.popleft()
+                if len(self._allocation_rate_times) + extra <= cap:
+                    for _ in range(extra):
+                        self._allocation_rate_times.append(now)
+                    return
+                wait = self._allocation_rate_times[0] + window - now
+                await asyncio.sleep(max(wait, 0.001))
 
     def allocations_per_minute_recent(self) -> float:
         """Сколько раз выдали IP за последние ~60 с (скорость «перебора»)."""
@@ -86,20 +164,86 @@ class SelectelScannerApp:
             self._rate_samples.popleft()
         return float(sum(n for _, n in self._rate_samples))
 
-    def miss_ip_counts_snapshot(self) -> dict[str, int]:
-        return dict(self._miss_ip_counts)
+    def miss_churn_snapshot(self) -> MissChurnSnapshot:
+        ipv4 = {
+            k: (int(v["events"]), str(v["first_ip"]))
+            for k, v in self._miss_ipv4_by_net.items()
+            if int(v["events"]) > 0
+        }
+        return MissChurnSnapshot(ipv4=ipv4, other=dict(self._miss_other))
 
     def distinct_allocated_ips(self) -> set[str]:
         return set(self._allocation_ip_counts.keys())
 
-    def deleted_miss_address_set(self) -> set[str]:
-        return set(self._deleted_miss_addresses)
+    def deleted_miss_ops_total(self) -> int:
+        return int(self._deleted_miss_ops)
 
     def unique_alloc_by_region(self, region: str) -> int:
         return len(self._alloc_addrs_by_region.get(region, ()))
 
-    def unique_deleted_miss_by_region(self, region: str) -> int:
-        return len(self._deleted_miss_addrs_by_region.get(region, ()))
+    def deleted_miss_ops_in_region(self, region: str) -> int:
+        return int(self._deleted_miss_ops_by_region.get(region, 0))
+
+    def whitelist_miss_events_in_region(self, region: str) -> int:
+        """Сумма засчитанных промахов по региону (колонка Miss; после DELETE тот же IP может снова добавиться)."""
+        return int(self._whitelist_miss_events_by_region.get(region, 0))
+
+    def audit_report_lines(self) -> list[str]:
+        """Сводка для сравнения: реальные IP при выдаче/удалении vs счётчики Miss (только при audit=True)."""
+        if not self.audit:
+            return []
+        snap = self.miss_churn_snapshot()
+        sum_slash24 = sum(int(v["events"]) for v in self._miss_ipv4_by_net.values())
+        sum_other = sum(snap.other.values())
+        churn_sum = sum_slash24 + sum_other
+
+        def _sort_ip(s: str) -> tuple:
+            try:
+                return (0, ipaddress.ip_address(s))
+            except ValueError:
+                return (1, s)
+
+        lines = [
+            "",
+            "========== АУДИТ IP (канонический вид) ==========",
+            f"Событий выдачи (строк в батчах, с повторами): {len(self._audit_alloc_events)}",
+            f"Уникальных IP среди выдач: {len(self._audit_unique_alloc)}",
+            "Уникальные выданные IP (полностью):",
+        ]
+        for ip in sorted(self._audit_unique_alloc, key=_sort_ip):
+            lines.append(f"  {ip}")
+        lines.append(
+            f"Успешных DELETE по промаху (операций): {len(self._audit_delete_miss_hits)}; "
+            f"уникальных адресов среди них: {len(set(self._audit_delete_miss_hits))}"
+        )
+        if self._audit_delete_miss_hits:
+            lines.append("Каждое успешное удаление (miss), по порядку:")
+            for ip in self._audit_delete_miss_hits:
+                lines.append(f"  del {ip}")
+        miss_unique = sorted(set(self._audit_miss_increments), key=_sort_ip)
+        lines.extend(
+            [
+                "",
+                "---------- Сверка с панелью Miss ----------",
+                f"Засчитано инкрементов Miss (каждый +1): {len(self._audit_miss_increments)}",
+                f"Уникальных IP среди инкрементов Miss: {len(miss_unique)}",
+                f"Сумма Miss по /24 (events) + прочие: {churn_sum} (= {sum_slash24} + {sum_other})",
+                "Совпадение len(инкременты) с суммой по панели: "
+                + (
+                    "да"
+                    if len(self._audit_miss_increments) == churn_sum
+                    else f"нет ({len(self._audit_miss_increments)} vs {churn_sum})"
+                ),
+            ]
+        )
+        lines.append("Уникальные IP, по которым был хотя бы один Miss:")
+        for ip in miss_unique:
+            lines.append(f"  {ip}")
+        lines.append("==============================================")
+        return lines
+
+    def unique_match_count(self) -> int:
+        return len(self._matched_addresses)
 
     def _record_allocation_batch(self, records: list[FloatingIPRecord], region: str) -> None:
         now = time.monotonic()
@@ -110,22 +254,82 @@ class SelectelScannerApp:
                 continue
             self._allocation_ip_counts[addr] = self._allocation_ip_counts.get(addr, 0) + 1
             self._alloc_addrs_by_region[region].add(addr)
+            if self.audit:
+                ak = canonical_ip_address(addr) or addr
+                self._audit_unique_alloc.add(ak)
+                self._audit_alloc_events.append(ak)
             batch += 1
         if batch:
             self._rate_samples.append((now, batch))
             while self._rate_samples and now - self._rate_samples[0][0] > 60.0:
                 self._rate_samples.popleft()
 
-    def _record_miss_hits(self, misses: list[FloatingIPRecord]) -> None:
+    @staticmethod
+    def _miss_stat_key(addr: str) -> str | None:
+        """Ключ учёта Miss: канонический IP или исходная строка, если не IP."""
+        s = (addr or "").strip()
+        if not s:
+            return None
+        c = canonical_ip_address(s)
+        return c if c is not None else s
+
+    def _is_true_whitelist_miss(self, record: FloatingIPRecord) -> bool:
+        """Промах для панели «не whitelist»: не дубликат уже учтённого match и адрес вне whitelist."""
+        if record.id in self.matches:
+            return False
+        if record.address.strip() in self._matched_addresses:
+            return False
+        return not self.matcher.contains(record.address)
+
+    def _record_miss_hits(
+        self,
+        misses: list[FloatingIPRecord],
+        *,
+        worker_region: str | None = None,
+    ) -> None:
+        wr = (worker_region or "").strip()
+        seen_in_batch: set[str] = set()
         for record in misses:
             addr = record.address.strip()
-            if not addr:
+            key = self._miss_stat_key(addr)
+            if not key:
                 continue
-            self._miss_ip_counts[addr] = self._miss_ip_counts.get(addr, 0) + 1
+            # Один и тот же адрес не должен учитываться дважды в одном вызове (дубликаты в списке)
+            if key in seen_in_batch:
+                continue
+            seen_in_batch.add(key)
+            if key in self._miss_ips_counted:
+                continue
+            self._miss_ips_counted.add(key)
+            if self.audit:
+                self._audit_miss_increments.append(key)
+            reg_bucket = (record.region or "").strip() or wr
+            if reg_bucket:
+                self._whitelist_miss_events_by_region[reg_bucket] += 1
+            display_addr = canonical_ip_address(addr) or addr
+            net_s = ipv4_slash24_key(addr)
+            if net_s is not None:
+                st = self._miss_ipv4_by_net[net_s]
+                if int(st["events"]) == 0:
+                    st["first_ip"] = display_addr
+                st["events"] = int(st["events"]) + 1
+            else:
+                self._miss_other[key] += 1
 
     def log(self, level: str, message: str) -> None:
         self.events.append(EventRecord.create(level, message))
-        if not self.interactive and self.emit_console_output:
+        if not self.emit_console_output:
+            return
+        line = f"{level.upper()} {message}"
+        if self._log_file_handle is not None:
+            self._log_file_handle.write(line + "\n")
+            self._log_file_handle.flush()
+        if self.log_to_stderr:
+            print(line, file=sys.stderr, flush=True)
+            return
+        if self.suppress_console_log:
+            return
+        if not self.interactive:
             style = {
                 "info": "white",
                 "warning": "yellow",
@@ -154,7 +358,7 @@ class SelectelScannerApp:
             existing = await self.client.list_floating_ips(regions=set(self.settings.regions))
             existing = await self._cleanup_existing_non_matches(existing, reason="startup")
             await self._adopt_existing_inventory(existing)
-            if len(self.matches) >= self.settings.target_count:
+            if self.unique_match_count() >= self.settings.target_count:
                 self.log("success", "Target count already satisfied by existing floating IPs")
                 return 0
 
@@ -175,13 +379,13 @@ class SelectelScannerApp:
                             project_label=self.project_label,
                             unique_ips=self.unique_allocated_ip_count(),
                             ips_per_minute=self.allocations_per_minute_recent(),
-                            miss_ip_counts=self.miss_ip_counts_snapshot(),
-                            delete_unique_addrs=len(self._deleted_miss_addresses),
+                            miss_churn=self.miss_churn_snapshot(),
+                            delete_miss_ops=self._deleted_miss_ops,
                             region_alloc_unique={
                                 r: self.unique_alloc_by_region(r) for r in self.region_states
                             },
-                            region_del_unique={
-                                r: self.unique_deleted_miss_by_region(r) for r in self.region_states
+                            region_del_ops={
+                                r: self.deleted_miss_ops_in_region(r) for r in self.region_states
                             },
                         ),
                         console=self.console,
@@ -189,7 +393,7 @@ class SelectelScannerApp:
                         refresh_per_second=self.settings.live_refresh_per_second,
                     ) as live:
                         while not self.stop_event.is_set():
-                            if len(self.matches) >= self.settings.target_count:
+                            if self.unique_match_count() >= self.settings.target_count:
                                 self.stop_event.set()
                                 break
                             live.update(
@@ -203,20 +407,20 @@ class SelectelScannerApp:
                                     project_label=self.project_label,
                                     unique_ips=self.unique_allocated_ip_count(),
                                     ips_per_minute=self.allocations_per_minute_recent(),
-                                    miss_ip_counts=self.miss_ip_counts_snapshot(),
-                                    delete_unique_addrs=len(self._deleted_miss_addresses),
+                                    miss_churn=self.miss_churn_snapshot(),
+                                    delete_miss_ops=self._deleted_miss_ops,
                                     region_alloc_unique={
                                         r: self.unique_alloc_by_region(r) for r in self.region_states
                                     },
-                                    region_del_unique={
-                                        r: self.unique_deleted_miss_by_region(r) for r in self.region_states
+                                    region_del_ops={
+                                        r: self.deleted_miss_ops_in_region(r) for r in self.region_states
                                     },
                                 )
                             )
                             await asyncio.sleep(1.0 / self.settings.live_refresh_per_second)
                 else:
                     while not self.stop_event.is_set():
-                        if len(self.matches) >= self.settings.target_count:
+                        if self.unique_match_count() >= self.settings.target_count:
                             self.stop_event.set()
                             break
                         await asyncio.sleep(1.0 / self.settings.live_refresh_per_second)
@@ -231,6 +435,9 @@ class SelectelScannerApp:
 
             return 0
         finally:
+            if self._log_file_handle is not None:
+                self._log_file_handle.close()
+                self._log_file_handle = None
             await self._cleanup_owned_unmatched()
             self.match_store.save(self.matches)
             await self.client.close()
@@ -320,13 +527,13 @@ class SelectelScannerApp:
         for match_id, persisted in self.persisted_matches.items():
             current = current_records.get(match_id)
             if current is not None:
-                self.matches[match_id] = MatchRecord.from_floating_ip(current, source=persisted.source)
+                self._remember_match(current, source=persisted.source)
 
         existing_matches = 0
         for record in existing_records:
             if self.matcher.contains(record.address):
-                self.matches.setdefault(record.id, MatchRecord.from_floating_ip(record, source="existing"))
-                existing_matches += 1
+                if self._remember_match(record, source="existing"):
+                    existing_matches += 1
             else:
                 self.seen_non_match_ips.add(record.address)
 
@@ -339,7 +546,7 @@ class SelectelScannerApp:
     async def _region_worker(self, region: str) -> None:
         state = self.region_states[region]
         while not self.stop_event.is_set():
-            if len(self.matches) >= self.settings.target_count:
+            if self.unique_match_count() >= self.settings.target_count:
                 self.stop_event.set()
                 break
 
@@ -349,13 +556,19 @@ class SelectelScannerApp:
                 continue
 
             state.inflight = state.batch_size
+            planned = state.batch_size
+            allocated: list[FloatingIPRecord] = []
+            await self._allocation_rate_reserve(planned)
             try:
-                allocated = await self.client.allocate_floating_ips(
-                    region,
-                    state.batch_size,
-                    poll_attempts=self.settings.allocation_poll_attempts,
-                    poll_delay=self.settings.allocation_poll_delay,
-                )
+                try:
+                    allocated = await self.client.allocate_floating_ips(
+                        region,
+                        state.batch_size,
+                        poll_attempts=self.settings.allocation_poll_attempts,
+                        poll_delay=self.settings.allocation_poll_delay,
+                    )
+                finally:
+                    await self._allocation_rate_finalize(planned, len(allocated))
                 state.inflight = 0
                 if not allocated:
                     cooldown = apply_batch_result(
@@ -382,17 +595,22 @@ class SelectelScannerApp:
                     state.last_ip = record.address
 
                 matched, misses, duplicates = self._classify_allocated(allocated)
-                self._record_miss_hits(misses)
-                deleted_count = await self._delete_records(region, misses, reason="miss")
                 for record in matched:
                     self.owned_unmatched.pop(record.id, None)
                     self._register_match(record, source="allocated")
+                if self.unique_match_count() >= self.settings.target_count:
+                    self.stop_event.set()
+
+                # В misses попадают и «дубликаты» уже существующих match — не в Miss /24, не в Del#, не в miss_count
+                whitelist_misses = [r for r in misses if self._is_true_whitelist_miss(r)]
+                self._record_miss_hits(whitelist_misses, worker_region=region)
+                deleted_count = await self._delete_records(region, misses, reason="miss")
 
                 cooldown = apply_batch_result(
                     state,
                     created_count=len(allocated),
                     match_count=len(matched),
-                    miss_count=len(misses),
+                    miss_count=len(whitelist_misses),
                     duplicate_count=duplicates,
                     deleted_count=deleted_count,
                     min_batch_size=self.settings.min_batch_size,
@@ -404,8 +622,8 @@ class SelectelScannerApp:
                 self.log(
                     "info",
                     f"[{region}] batch: created={len(allocated)} matched={len(matched)} "
-                    f"misses={len(misses)} duplicates={duplicates} deleted={deleted_count} "
-                    f"next_batch={state.batch_size}",
+                    f"whitelist_misses={len(whitelist_misses)} raw_misses={len(misses)} "
+                    f"duplicates={duplicates} deleted={deleted_count} next_batch={state.batch_size}",
                 )
 
                 if matched:
@@ -445,16 +663,17 @@ class SelectelScannerApp:
         duplicates = 0
         matches: list[FloatingIPRecord] = []
         misses: list[FloatingIPRecord] = []
-        existing_match_ips = {match.address for match in self.matches.values()}
+        known_match_ips = set(self._matched_addresses)
 
         for record in records:
-            if record.id in self.matches or record.address in existing_match_ips:
+            if record.id in self.matches or record.address in known_match_ips:
                 duplicates += 1
                 misses.append(record)
                 continue
 
             if self.matcher.contains(record.address):
                 matches.append(record)
+                known_match_ips.add(record.address)
                 continue
 
             if record.address in self.seen_non_match_ips:
@@ -465,10 +684,20 @@ class SelectelScannerApp:
 
         return matches, misses, duplicates
 
-    def _register_match(self, record: FloatingIPRecord, source: str) -> None:
+    def _remember_match(self, record: FloatingIPRecord, source: str) -> bool:
+        addr = record.address.strip()
+        if not record.id or not addr or addr in self._matched_addresses:
+            return False
         match = MatchRecord.from_floating_ip(record, source=source)
         self.matches[record.id] = match
-        self.match_store.save(self.matches)
+        self._matched_addresses.add(addr)
+        return True
+
+    def _register_match(self, record: FloatingIPRecord, source: str) -> bool:
+        stored = self._remember_match(record, source=source)
+        if stored:
+            self.match_store.save(self.matches)
+        return stored
 
     async def _delete_records(
         self,
@@ -489,16 +718,30 @@ class SelectelScannerApp:
                     return False
                 if deleted:
                     self.owned_unmatched.pop(record.id, None)
-                    if reason == "miss" and record.address.strip():
-                        addr = record.address.strip()
-                        self._deleted_miss_addresses.add(addr)
+                    addr_st = record.address.strip()
+                    if (
+                        reason == "miss"
+                        and addr_st
+                        and self._is_true_whitelist_miss(record)
+                    ):
+                        self._deleted_miss_ops += 1
                         reg_bucket = (record.region or "").strip() or (
                             region if isinstance(region, str) and region not in ("startup", "reconcile", "cleanup") else ""
                         )
                         if reg_bucket:
-                            self._deleted_miss_addrs_by_region[reg_bucket].add(addr)
+                            self._deleted_miss_ops_by_region[reg_bucket] += 1
+                        # Снимаем с учёта: тот же IP из той же подсети после новой выдачи снова даст +1 Miss к /24
+                        mk = self._miss_stat_key(record.address)
+                        if mk:
+                            self._miss_ips_counted.discard(mk)
+                            if self.audit:
+                                self._audit_delete_miss_hits.append(mk)
                     return True
-                self.log("warning", f"[{region}] delete returned false for {record.resource_ref()} ({reason})")
+                self.log(
+                    "warning",
+                    f"[{region}] delete returned false for {record.resource_ref()} ({reason}) "
+                    f"— в Miss не входит (Miss только при выдаче IP; повтор DELETE возможен)",
+                )
                 return False
 
         results = await asyncio.gather(*(_delete_one(record) for record in records), return_exceptions=False)
@@ -518,7 +761,7 @@ class SelectelScannerApp:
         summary.add_column("Value")
         summary.add_row("Project", self.project_label)
         summary.add_row("Regions", ", ".join(self.settings.regions))
-        summary.add_row("Matches kept", str(len(self.matches)))
+        summary.add_row("Matches kept", str(self.unique_match_count()))
         summary.add_row(
             "Whitelist entries",
             str(self.matcher.summary.total_entries),
@@ -545,7 +788,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="High-throughput Selectel floating IP scanner")
     parser.add_argument("--config", dest="config_path")
     parser.add_argument("--whitelist", dest="whitelist_path")
-    parser.add_argument("--state", dest="state_path")
+    parser.add_argument("--state", dest="state_path", help="JSON с matches (по умолчанию temp/selectel-scanner-state.json)")
+    parser.add_argument(
+        "--state-section",
+        dest="state_section",
+        default="account-1",
+        help="Ключ секции в JSON (account-1 / account-2 / smoke) при общем файле состояния",
+    )
     parser.add_argument("--regions", nargs="+")
     parser.add_argument("--username")
     parser.add_argument("--password")
@@ -553,15 +802,58 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--project-name")
     parser.add_argument("--project-id")
     parser.add_argument("--target-count", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--max-batch-size", type=int, default=32)
-    parser.add_argument("--delete-concurrency", type=int, default=12)
-    parser.add_argument("--refresh-per-second", type=int, default=4)
-    parser.add_argument("--allocation-poll-attempts", type=int, default=6)
-    parser.add_argument("--allocation-poll-delay", type=float, default=0.7)
-    parser.add_argument("--cooldown-base", type=float, default=2.0)
-    parser.add_argument("--cooldown-max", type=float, default=20.0)
-    parser.add_argument("--reconcile-interval", type=float, default=10.0)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Минимальный размер батча выдачи (по умолчанию 1 IP за запрос)",
+    )
+    parser.add_argument(
+        "--max-batch-size",
+        type=int,
+        default=1,
+        help="Верхняя граница размера батча; при 1 всегда выдаётся по одному IP",
+    )
+    parser.add_argument("--delete-concurrency", type=int, default=8)
+    parser.add_argument(
+        "--refresh-per-second",
+        type=int,
+        default=6,
+        help="Частота обновления Rich (при батче 1 IP удобнее 5–8)",
+    )
+    parser.add_argument(
+        "--allocation-poll-attempts",
+        type=int,
+        default=5,
+        help="Попытки дождаться появления IP в списке после create (батч 1 → меньше)",
+    )
+    parser.add_argument(
+        "--allocation-poll-delay",
+        type=float,
+        default=0.45,
+        help="Пауза между попытками reconcile-списка (сек)",
+    )
+    parser.add_argument(
+        "--cooldown-base",
+        type=float,
+        default=1.2,
+        help="Базовая пауза при пустом ответе / ошибке (сек; под батч 1 IP ниже, чем для пачек)",
+    )
+    parser.add_argument("--cooldown-max", type=float, default=15.0)
+    parser.add_argument(
+        "--reconcile-interval",
+        type=float,
+        default=7.0,
+        help="Интервал фоновой сверки «лишних» floating IP (сек)",
+    )
+    parser.add_argument(
+        "--max-ips-per-minute",
+        type=int,
+        default=30,
+        dest="max_ips_per_minute",
+        help="Макс. выданных floating IP на этот аккаунт за скользящие 60 с (0 = без лимита). "
+        "30 и батч 1 → средний интервал ≥ 2 с между выдачами (60/30).",
+    )
     parser.add_argument("--keep-owned-misses", action="store_true")
     parser.add_argument("--keep-existing-non-matches", action="store_true")
     parser.add_argument(
@@ -569,7 +861,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force Rich full-screen Live dashboard (otherwise auto: TTY only)",
     )
+    parser.add_argument(
+        "--rich-logs",
+        action="store_true",
+        dest="rich_logs",
+        help="Вместе с Rich (dual): дублировать события в stderr, не отключая дашборд",
+    )
+    parser.add_argument(
+        "--log-file",
+        dest="log_file",
+        metavar="PATH",
+        help="Дописывать те же строки лога в файл (например temp/scanner.log в каталоге проекта)",
+    )
     return parser.parse_args(argv)
+
+
+def _env_int(name: str, fallback: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        return int(raw)
+    except ValueError:
+        return fallback
+
+
+def _env_float(name: str, fallback: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return fallback
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError:
+        return fallback
 
 
 def build_settings(args: argparse.Namespace) -> ScannerSettings:
@@ -591,9 +915,21 @@ def build_settings(args: argparse.Namespace) -> ScannerSettings:
     state_path = (
         Path(args.state_path).expanduser()
         if args.state_path
-        else TEMP_DIR / "selectel-scanner-matches.json"
+        else TEMP_DIR / "selectel-scanner-state.json"
     )
     regions = _resolve_regions(args, config)
+
+    target_count = _env_int("SEL_TARGET_COUNT", args.target_count)
+    min_batch = _env_int("SEL_BATCH_SIZE", args.batch_size)
+    max_batch = _env_int("SEL_MAX_BATCH_SIZE", args.max_batch_size)
+    delete_conc = _env_int("SEL_DELETE_CONCURRENCY", args.delete_concurrency)
+    refresh_ps = _env_int("SEL_REFRESH_PER_SECOND", args.refresh_per_second)
+    poll_attempts = _env_int("SEL_ALLOCATION_POLL_ATTEMPTS", args.allocation_poll_attempts)
+    poll_delay = _env_float("SEL_ALLOCATION_POLL_DELAY", args.allocation_poll_delay)
+    cooldown_base = _env_float("SEL_COOLDOWN_BASE", args.cooldown_base)
+    cooldown_max = _env_float("SEL_COOLDOWN_MAX", args.cooldown_max)
+    reconcile_iv = _env_float("SEL_RECONCILE_INTERVAL", args.reconcile_interval)
+    max_ipm = _env_int("SEL_MAX_IPS_PER_MINUTE", args.max_ips_per_minute)
 
     return ScannerSettings(
         username=username,
@@ -604,16 +940,18 @@ def build_settings(args: argparse.Namespace) -> ScannerSettings:
         whitelist_path=whitelist_path,
         state_path=state_path,
         regions=regions,
-        target_count=args.target_count,
-        min_batch_size=args.batch_size,
-        max_batch_size=args.max_batch_size,
-        delete_concurrency=args.delete_concurrency,
-        live_refresh_per_second=args.refresh_per_second,
-        allocation_poll_attempts=args.allocation_poll_attempts,
-        allocation_poll_delay=args.allocation_poll_delay,
-        cooldown_base=args.cooldown_base,
-        cooldown_max=args.cooldown_max,
-        reconcile_interval=args.reconcile_interval,
+        state_section=(args.state_section or "account-1").strip() or "account-1",
+        target_count=target_count,
+        min_batch_size=min_batch,
+        max_batch_size=max_batch,
+        delete_concurrency=delete_conc,
+        live_refresh_per_second=refresh_ps,
+        allocation_poll_attempts=poll_attempts,
+        allocation_poll_delay=poll_delay,
+        cooldown_base=cooldown_base,
+        cooldown_max=cooldown_max,
+        reconcile_interval=reconcile_iv,
+        max_floating_ips_per_minute=max_ipm,
         cleanup_on_exit=not args.keep_owned_misses,
         cleanup_existing_non_matches=not args.keep_existing_non_matches,
     )

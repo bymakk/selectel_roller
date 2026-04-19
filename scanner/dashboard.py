@@ -15,10 +15,13 @@ from .models import EventRecord, MatchRecord, RegionRunState, ScannerSettings
 from .rich_ui import DASHBOARD_PANEL_PADDING, DASHBOARD_TABLE_BOX, DASHBOARD_TABLE_PADDING
 from .whitelist import WhitelistSummary
 
-# Рамка + заголовок «Matches» + шапка таблицы + минимум 2–3 строки с IP.
-MATCHES_PANEL_MIN_LINES = 14
-# Строк таблицы «Выдачи вне белого списка» (остальное обрезается; высота панели — доля экрана, не фикс).
-MISS_CHURN_TABLE_MAX_ROWS = 72
+# Справа: компактный блок Matches (мин. высота в строках Rich) и более высокий блок «Выдачи».
+MATCHES_RIGHT_PANEL_MIN_LINES = 10
+# Доли вертикали правой колонки: Matches : Выдачи (1:3 — выдачи заметно выше).
+RIGHT_PANEL_MATCHES_RATIO = 1
+RIGHT_PANEL_MISS_CHURN_RATIO = 3
+# Строк таблицы «Выдачи вне белого списка» (остальное обрезается).
+MISS_CHURN_TABLE_MAX_ROWS = 96
 
 
 def summarize_regions(regions: list[RegionRunState]) -> dict[str, int]:
@@ -101,8 +104,16 @@ def build_dashboard(
         Layout(name="events", ratio=1),
     )
     layout["right"].split_column(
-        Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
-        Layout(name="miss_churn", ratio=1, minimum_size=12),
+        Layout(
+            name="matches_pane",
+            ratio=RIGHT_PANEL_MATCHES_RATIO,
+            minimum_size=MATCHES_RIGHT_PANEL_MIN_LINES,
+        ),
+        Layout(
+            name="miss_churn",
+            ratio=RIGHT_PANEL_MISS_CHURN_RATIO,
+            minimum_size=12,
+        ),
     )
 
     totals = summarize_regions(regions)

@@ -19,8 +19,10 @@ from rich.text import Text
 from .client import SelectelScannerClient
 from .config import ScannerConfig, load_scanner_config
 from .dashboard import (
-    MATCHES_PANEL_MIN_LINES,
+    MATCHES_RIGHT_PANEL_MIN_LINES,
     MISS_CHURN_TABLE_MAX_ROWS,
+    RIGHT_PANEL_MATCHES_RATIO,
+    RIGHT_PANEL_MISS_CHURN_RATIO,
     format_uptime,
     region_result_style,
     regions_panel_layout_height,
@@ -524,8 +526,16 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
         )
 
     layout["right"].split_column(
-        Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
-        Layout(name="miss_churn", ratio=1, minimum_size=12),
+        Layout(
+            name="matches_pane",
+            ratio=RIGHT_PANEL_MATCHES_RATIO,
+            minimum_size=MATCHES_RIGHT_PANEL_MIN_LINES,
+        ),
+        Layout(
+            name="miss_churn",
+            ratio=RIGHT_PANEL_MISS_CHURN_RATIO,
+            minimum_size=12,
+        ),
     )
     _, _, miss_merged, _ = _merged_global_stats(accounts)
     persist_miss_churn_text(miss_merged)

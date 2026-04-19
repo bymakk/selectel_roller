@@ -43,10 +43,10 @@ def merge_miss_churn_snapshots(*snapshots: MissChurnSnapshot) -> MissChurnSnapsh
     return MissChurnSnapshot(ipv4=ipv4_out, other=other_acc)
 
 
-def miss_churn_display_rows(snapshot: MissChurnSnapshot | None) -> list[tuple[str, str]]:
-    """Строки как в UI: (Target, Miss). IPv4 с несколькими промахами — одна строка на подсеть x.x.x.0/24."""
+def _miss_churn_sorted_targets_and_counts(snapshot: MissChurnSnapshot | None) -> list[tuple[str, int]]:
+    """Отсортированные (Target, число Miss) без процентов."""
     snap = snapshot or MissChurnSnapshot(ipv4={}, other={})
-    rows: list[tuple[tuple[float, str], str, str]] = []
+    rows: list[tuple[tuple[float, str], str, int]] = []
 
     for net_s, (events, first_ip) in snap.ipv4.items():
         ev = int(events)
@@ -57,27 +57,44 @@ def miss_churn_display_rows(snapshot: MissChurnSnapshot | None) -> list[tuple[st
         else:
             net_obj = ipaddress.ip_network(net_s, strict=False)
             target = f"{net_obj.network_address}/24"
-        rows.append(((-float(ev), target), target, str(ev)))
+        rows.append(((-float(ev), target), target, ev))
 
     for ip, cnt in snap.other.items():
         c = int(cnt)
         if c <= 0:
             continue
-        rows.append(((-float(c), ip), ip, str(c)))
+        rows.append(((-float(c), ip), ip, c))
 
     rows.sort(key=lambda item: item[0])
-    return [(left, right) for _, left, right in rows]
+    return [(left, cnt) for _, left, cnt in rows]
+
+
+def _miss_pct_share(count: int, total: int) -> int:
+    if total <= 0:
+        return 0
+    return int(round(100.0 * float(count) / float(total)))
+
+
+def miss_churn_display_rows(snapshot: MissChurnSnapshot | None) -> list[tuple[str, str]]:
+    """Строки как в UI: (Target, Miss с долей), например «48 (10%)». Доля — от суммы Miss по всем строкам."""
+    counts = _miss_churn_sorted_targets_and_counts(snapshot)
+    total = sum(c for _, c in counts)
+    out: list[tuple[str, str]] = []
+    for target, c in counts:
+        pct = _miss_pct_share(c, total)
+        out.append((target, f"{c} ({pct}%)"))
+    return out
 
 
 def format_miss_churn_plaintext(snapshot: MissChurnSnapshot | None) -> str:
-    """Текст для копирования: как колонки Target и Miss — слева подсеть/IP, справа число выровнено."""
+    """Текст для копирования: Target слева, справа «число (N%)»."""
     pairs = miss_churn_display_rows(snapshot)
     if not pairs:
         return "—  0\n"
     tw = max(len(t) for t, _ in pairs)
     tw = max(tw, 12)
-    cw = max(len(c) for _, c in pairs)
-    lines = [f"{t.ljust(tw)}  {c:>{cw}}" for t, c in pairs]
+    rw = max(len(r) for _, r in pairs)
+    lines = [f"{t.ljust(tw)}  {r:>{rw}}" for t, r in pairs]
     return "\n".join(lines) + "\n"
 
 
@@ -102,7 +119,7 @@ def render_miss_churn_table(snapshot: MissChurnSnapshot | None, *, max_rows: int
         padding=DASHBOARD_TABLE_PADDING,
     )
     table.add_column("Target", overflow="fold", style="yellow")
-    table.add_column("Miss", justify="right", style="dim")
+    table.add_column("Miss (%)", justify="right", style="dim")
 
     pairs = miss_churn_display_rows(snapshot)
     if not pairs:
@@ -115,7 +132,7 @@ def render_miss_churn_table(snapshot: MissChurnSnapshot | None, *, max_rows: int
             if overflow > 0:
                 table.add_row(f"... +{overflow} строк", "")
             break
-        table.add_row(left, right)
+        table.add_row(left, right)  # right: «48 (10%)»
 
     return table
 

@@ -20,6 +20,7 @@ from .client import SelectelScannerClient
 from .config import ScannerConfig, load_scanner_config
 from .dashboard import (
     MATCHES_PANEL_MIN_LINES,
+    MISS_CHURN_TABLE_MAX_ROWS,
     format_uptime,
     region_result_style,
     regions_panel_layout_height,
@@ -524,7 +525,7 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
 
     layout["right"].split_column(
         Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
-        Layout(name="miss_churn", size=56),
+        Layout(name="miss_churn", ratio=1, minimum_size=12),
     )
     _, _, miss_merged, _ = _merged_global_stats(accounts)
     persist_miss_churn_text(miss_merged)
@@ -537,7 +538,7 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
     )
     layout["miss_churn"].update(
         Panel(
-            render_miss_churn_table(miss_merged, max_rows=180),
+            render_miss_churn_table(miss_merged, max_rows=MISS_CHURN_TABLE_MAX_ROWS),
             title="Выдачи вне белого списка",
             border_style="yellow",
             padding=DASHBOARD_PANEL_PADDING,

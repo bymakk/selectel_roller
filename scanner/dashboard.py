@@ -17,6 +17,8 @@ from .whitelist import WhitelistSummary
 
 # Рамка + заголовок «Matches» + шапка таблицы + минимум 2–3 строки с IP.
 MATCHES_PANEL_MIN_LINES = 14
+# Строк таблицы «Выдачи вне белого списка» (остальное обрезается; высота панели — доля экрана, не фикс).
+MISS_CHURN_TABLE_MAX_ROWS = 72
 
 
 def summarize_regions(regions: list[RegionRunState]) -> dict[str, int]:
@@ -100,7 +102,7 @@ def build_dashboard(
     )
     layout["right"].split_column(
         Layout(name="matches_pane", ratio=1, minimum_size=MATCHES_PANEL_MIN_LINES),
-        Layout(name="miss_churn", size=56),
+        Layout(name="miss_churn", ratio=1, minimum_size=12),
     )
 
     totals = summarize_regions(regions)
@@ -152,7 +154,7 @@ def build_dashboard(
     persist_miss_churn_text(snap)
     layout["miss_churn"].update(
         Panel(
-            render_miss_churn_table(snap, max_rows=180),
+            render_miss_churn_table(snap, max_rows=MISS_CHURN_TABLE_MAX_ROWS),
             title="Выдачи вне белого списка",
             border_style="yellow",
             padding=DASHBOARD_PANEL_PADDING,

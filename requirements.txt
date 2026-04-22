@@ -2,3 +2,4 @@ httpx[http2]>=0.24.0
 h2>=4.1.0
 rich>=13.0.0
 python-dotenv>=1.0.0
+questionary>=2.0.0

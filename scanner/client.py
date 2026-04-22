@@ -38,6 +38,8 @@ class SelectelScannerClient:
         self._token_expires: datetime | None = None
         self._auth_lock = asyncio.Lock()
         self._neutron_urls: dict[str, str] = {}
+        self._nova_urls: dict[str, str] = {}
+        self._cinder_urls: dict[str, str] = {}
         self._external_network_ids: dict[str, str] = {}
         self._resource_regions: dict[str, str] = {}
 
@@ -155,21 +157,30 @@ class SelectelScannerClient:
 
     def _apply_service_catalog(self, payload: dict[str, Any]) -> None:
         self._neutron_urls = {}
+        self._nova_urls = {}
+        self._cinder_urls = {}
         services = payload.get("token", {}).get("catalog", [])
         for service in services:
-            if str(service.get("type", "")).strip().lower() != "network":
+            stype = str(service.get("type", "")).strip().lower()
+            if stype not in ("network", "compute", "volumev3", "block-storage"):
                 continue
             for endpoint in service.get("endpoints", []):
                 region = str(endpoint.get("region_id") or endpoint.get("region") or "").strip()
                 if not region:
                     continue
-                if self.regions and region not in self.regions:
+                if stype == "network" and self.regions and region not in self.regions:
                     continue
                 if endpoint.get("interface") != "public":
                     continue
                 url = str(endpoint.get("url", "")).rstrip("/")
-                if url:
+                if not url:
+                    continue
+                if stype == "network":
                     self._neutron_urls[region] = url
+                elif stype == "compute":
+                    self._nova_urls[region] = url
+                else:
+                    self._cinder_urls[region] = url
 
         missing = [region for region in self.regions if region not in self._neutron_urls]
         if missing:
@@ -186,6 +197,111 @@ class SelectelScannerClient:
 
     def available_regions(self) -> tuple[str, ...]:
         return tuple(self._neutron_urls.keys())
+
+    def compute_regions(self) -> tuple[str, ...]:
+        return tuple(self._nova_urls.keys())
+
+    async def list_servers(self, *, regions: set[str] | None = None) -> list[dict[str, Any]]:
+        """Возвращает краткий список VM по регионам (через Nova `/servers/detail`).
+
+        Результат: каждый элемент — словарь с ключами id, name, status, region.
+        Если у проекта нет compute-эндпойнтов в service catalog — возвращает пустой список.
+        """
+        await self.ensure_authenticated()
+        if not self._nova_urls:
+            return []
+        target_regions = tuple(regions or set(self._nova_urls.keys()))
+        servers: list[dict[str, Any]] = []
+        for region in target_regions:
+            base = self._nova_urls.get(region, "").rstrip("/")
+            if not base:
+                continue
+            try:
+                response = await self._request("GET", f"{base}/servers/detail")
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (403, 404):
+                    continue
+                raise
+            items = response.json().get("servers", [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                servers.append(
+                    {
+                        "id": str(item.get("id") or "").strip(),
+                        "name": str(item.get("name") or "").strip(),
+                        "status": str(item.get("status") or "").strip(),
+                        "region": region,
+                    }
+                )
+        return servers
+
+    def volume_regions(self) -> tuple[str, ...]:
+        return tuple(self._cinder_urls.keys())
+
+    async def delete_server(self, region: str, server_id: str) -> bool:
+        """Удаляет VM в регионе. True если удалена (или уже не существует)."""
+        await self.ensure_authenticated()
+        base = self._nova_urls.get(region, "").rstrip("/")
+        if not base or not server_id.strip():
+            return False
+        try:
+            response = await self._request(
+                "DELETE", f"{base}/servers/{server_id.strip()}"
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (404, 409):
+                return exc.response.status_code == 404
+            raise
+        return response.status_code in (200, 202, 204)
+
+    async def list_volumes(
+        self, *, regions: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Возвращает краткий список volume'ов по регионам (через Cinder `/volumes/detail`)."""
+        await self.ensure_authenticated()
+        if not self._cinder_urls:
+            return []
+        target_regions = tuple(regions or set(self._cinder_urls.keys()))
+        volumes: list[dict[str, Any]] = []
+        for region in target_regions:
+            base = self._cinder_urls.get(region, "").rstrip("/")
+            if not base:
+                continue
+            try:
+                response = await self._request("GET", f"{base}/volumes/detail")
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code in (403, 404):
+                    continue
+                raise
+            for item in response.json().get("volumes", []):
+                if not isinstance(item, dict):
+                    continue
+                volumes.append(
+                    {
+                        "id": str(item.get("id") or "").strip(),
+                        "name": str(item.get("name") or "").strip(),
+                        "status": str(item.get("status") or "").strip(),
+                        "region": region,
+                        "size": int(item.get("size") or 0),
+                    }
+                )
+        return volumes
+
+    async def delete_volume(self, region: str, volume_id: str) -> bool:
+        """Удаляет volume (cascade=true — вместе со снапшотами)."""
+        await self.ensure_authenticated()
+        base = self._cinder_urls.get(region, "").rstrip("/")
+        if not base or not volume_id.strip():
+            return False
+        url = f"{base}/volumes/{volume_id.strip()}?cascade=true"
+        try:
+            response = await self._request("DELETE", url)
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                return True
+            raise
+        return response.status_code in (200, 202, 204)
 
     async def _request(
         self,

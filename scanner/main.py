@@ -789,11 +789,21 @@ class SelectelScannerApp:
             return 0
 
         async def _delete_one(record: FloatingIPRecord) -> bool:
+            # Двойная защита whitelist: первый слой — в _delete_records выше (сразу
+            # отрезает сам список), второй слой — здесь, прямо перед HTTP-вызовом,
+            # на случай, если список изменился между фильтрацией и этим моментом.
             if record.id in self.matches or self._ip_in_whitelist(record):
-                # Матчи и адреса из whitelist.txt никогда не удаляем (в т.ч. ветка «дубликат» в батче).
                 return False
             addr = (record.address or "").strip()
             async with self.delete_semaphore:
+                # Третий слой: после взятия семафора whitelist мог быть обновлён на диске —
+                # дочитываем, чтобы свежие записи успели защитить запись от DELETE.
+                if self._ip_in_whitelist(record):
+                    self.log(
+                        "info",
+                        f"[{region}] Whitelist обновился — пропускаю DELETE для {addr}",
+                    )
+                    return False
                 try:
                     deleted = await self.client.delete_floating_ip(record.id)
                 except Exception as exc:
@@ -974,6 +984,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PATH",
         help="Дописывать те же строки лога в файл (например temp/scanner.log в каталоге проекта)",
     )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        dest="assume_yes",
+        action="store_true",
+        help="Пропустить подтверждение, если в проекте уже есть VM (иначе сканер остановится)",
+    )
+    parser.add_argument(
+        "--no-auto-create-project",
+        dest="auto_create_project",
+        action="store_false",
+        default=True,
+        help="Не создавать новый проект автоматически, если его нет у аккаунта",
+    )
+    parser.add_argument(
+        "--auto-project-name",
+        dest="auto_project_name",
+        default="ip-roller",
+        help="Имя проекта для автосоздания, если у аккаунта ещё нет проектов (по умолчанию ip-roller)",
+    )
+    parser.add_argument(
+        "--setup",
+        dest="force_setup",
+        action="store_true",
+        help="Принудительно запустить мастер настройки и перезаписать учётные данные в .env",
+    )
     return parser.parse_args(argv)
 
 
@@ -997,7 +1033,12 @@ def _env_float(name: str, fallback: float) -> float:
         return fallback
 
 
-def build_settings(args: argparse.Namespace, *, allow_incomplete_primary: bool = False) -> ScannerSettings:
+def build_settings(
+    args: argparse.Namespace,
+    *,
+    allow_incomplete_primary: bool = False,
+    require_project: bool = True,
+) -> ScannerSettings:
     config = load_scanner_config(args.config_path)
     selectel_config = config.selectel.api
 
@@ -1010,7 +1051,7 @@ def build_settings(args: argparse.Namespace, *, allow_incomplete_primary: bool =
     if not allow_incomplete_primary:
         if not username or not password or not account_id:
             raise ValueError("username, password and account_id are required for Selectel Scanner")
-        if not project_name and not project_id:
+        if require_project and not project_name and not project_id:
             raise ValueError("project_name or project_id is required for Selectel Scanner")
 
     whitelist_path = Path(args.whitelist_path).expanduser() if args.whitelist_path else DEFAULT_WHITELIST_PATH

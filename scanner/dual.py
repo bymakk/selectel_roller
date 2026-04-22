@@ -16,6 +16,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .bootstrap import (
+    confirm_no_active_vms,
+    ensure_project_resolved,
+    render_whitelist_banner,
+)
 from .client import SelectelScannerClient
 from .config import ScannerConfig, load_scanner_config
 from .dashboard import (
@@ -36,7 +41,9 @@ from .ip_frequency import (
 )
 from .main import SelectelScannerApp, _normalize_regions, build_settings, parse_args
 from .models import EventRecord, MatchRecord, RegionRunState, ScannerSettings
+from .paths import DEFAULT_WHITELIST_PATH
 from .rich_ui import DASHBOARD_PANEL_PADDING, DASHBOARD_TABLE_BOX, DASHBOARD_TABLE_PADDING, dashboard_console, dashboard_console_stderr
+from .setup_wizard import needs_setup, run_setup_wizard
 
 
 ONLY_REGIONS = ("ru-1", "ru-2", "ru-3")
@@ -186,11 +193,7 @@ def _validate_worker_credentials(
         missing.append("SEL_ACCOUNT_ID" if env_hint_primary else "SEL2_ACCOUNT_ID")
     if missing:
         return f"{worker_title} не запущен: не задано — {', '.join(missing)}"
-    if not creds.get("project_name") and not creds.get("project_id"):
-        return (
-            f"{worker_title} не запущен: нужен проект — "
-            f"{'SEL_PROJECT_NAME или SEL_PROJECT_ID' if env_hint_primary else 'SEL2_PROJECT_NAME или SEL2_PROJECT_ID'}"
-        )
+    # Проект не обязателен: если не задан — попробуем автодискавери через VPC Resell API.
     return None
 
 
@@ -323,8 +326,7 @@ def _build_secondary_settings(
         raise ValueError(
             "Задайте второй аккаунт в .env (SEL2_*) или в config.json → selectel.additional_accounts[0]"
         )
-    if not project_name and not project_id:
-        raise ValueError("Second account requires project_name or project_id")
+    # project_name / project_id может отсутствовать — bootstrap-этап запросит через Resell API.
 
     return ScannerSettings(
         username=username,
@@ -357,6 +359,44 @@ def _compact_label(label: str) -> str:
     if len(primary) <= 16:
         return primary
     return f"{primary[:13]}..."
+
+
+def _render_mode_banner(console: Console, *, wp: bool, ws: bool) -> None:
+    """Явно сообщает пользователю, в каком режиме будет работать программа.
+
+    Отделено от dashboard-а, чтобы даже в non-interactive режиме было понятно,
+    что запускается один или два воркера.
+    """
+    if wp and ws:
+        text = (
+            "[bold]Режим:[/bold] [cyan]два аккаунта[/cyan] "
+            "(SEL_* и SEL2_*).\n"
+            "Интерфейс покажет обе колонки воркеров параллельно."
+        )
+        border = "cyan"
+    elif wp:
+        text = (
+            "[bold]Режим:[/bold] [green]один аккаунт[/green] (SEL_*).\n"
+            "Второй аккаунт не задан — запускается single-интерфейс.\n"
+            "[dim]Чтобы добавить второй, пропишите SEL2_USERNAME / SEL2_PASSWORD / "
+            "SEL2_ACCOUNT_ID в .env или запустите `--setup` снова.[/dim]"
+        )
+        border = "green"
+    else:
+        text = (
+            "[bold]Режим:[/bold] [green]один аккаунт[/green] (только SEL2_*).\n"
+            "Первый аккаунт не задан — запускается single-интерфейс по SEL2_*."
+        )
+        border = "green"
+
+    console.print(
+        Panel(
+            text,
+            title="ip-roller",
+            border_style=border,
+            padding=DASHBOARD_PANEL_PADDING,
+        )
+    )
 
 
 def _disabled_worker_regions_panel(label: str) -> Panel:
@@ -487,10 +527,16 @@ def _build_dual_dashboard(slots: list[WorkerSlot]) -> Layout:
         Layout(name="workers", ratio=3),
         Layout(name="right", ratio=2, minimum_size=40),
     )
-    layout["workers"].split_column(
-        Layout(name="account_1_workers"),
-        Layout(name="account_2_workers"),
-    )
+    # Динамическое количество воркеров-колонок: по числу слотов, которые пользователь
+    # действительно хотел запустить. Если активен только один — не тратим место на пустую половину.
+    if len(slots) <= 1:
+        layout["workers"].split_column(
+            Layout(name="account_1_workers"),
+        )
+    else:
+        layout["workers"].split_column(
+            *[Layout(name=f"account_{i}_workers") for i in range(1, len(slots) + 1)]
+        )
     layout["header"].update(_build_dual_header(slots))
 
     for index, slot in enumerate(slots, start=1):
@@ -578,6 +624,45 @@ def _print_help() -> int:
     return exit_code
 
 
+async def _bootstrap_account(
+    settings: ScannerSettings,
+    *,
+    console: Console,
+    args: argparse.Namespace,
+    account_label: str,
+    env_prefix: str,
+    interactive_ui: bool,
+) -> None:
+    """Автодискавери проекта + проверка VM. Меняет settings inplace.
+
+    Эта фаза выполняется ДО запуска Rich Live-дашборда, поэтому здесь безопасно
+    показывать интерактивные диалоги (questionary / Rich Confirm).
+    """
+    assume_yes = bool(getattr(args, "assume_yes", False))
+    auto_create = bool(getattr(args, "auto_create_project", True))
+    auto_project_name = getattr(args, "auto_project_name", None) or "ip-roller"
+    # На bootstrap-фазе Live ещё не запущен, поэтому интерактивные диалоги доступны
+    # везде, где есть настоящий TTY. interactive_ui здесь не мешает.
+    _ = interactive_ui
+
+    await ensure_project_resolved(
+        settings,
+        console=console,
+        account_label=account_label,
+        dotenv_env_prefix=env_prefix,
+        desired_name=auto_project_name,
+        auto_create=auto_create,
+        interactive=True,
+    )
+    await confirm_no_active_vms(
+        settings,
+        console=console,
+        account_label=account_label,
+        assume_yes=assume_yes,
+        interactive=True,
+    )
+
+
 async def _run_single_scanner_from_dual(
     settings: ScannerSettings,
     *,
@@ -605,6 +690,24 @@ async def run_async(argv: list[str] | None = None) -> int:
         return _print_help()
 
     args = parse_args(args_list)
+    console = dashboard_console()
+
+    # Подгружаем .env ДО проверки needs_setup(), чтобы уже сохранённые значения
+    # корректно считались в os.environ и wizard не запускался повторно.
+    from dotenv import load_dotenv as _load_dotenv
+
+    from .paths import DOTENV_PATH as _DOTENV_PATH
+
+    _load_dotenv(_DOTENV_PATH, override=False)
+
+    # Если .env ещё не заполнен — запускаем интерактивный wizard прямо здесь,
+    # до любых сетевых вызовов. `--setup` форсит повторный запуск wizard.
+    if getattr(args, "force_setup", False) or needs_setup():
+        run_setup_wizard(console)
+
+    # Превью whitelist — пользователь сразу видит, что защищено (объясняется «как тупому»).
+    render_whitelist_banner(console, DEFAULT_WHITELIST_PATH)
+
     config = load_scanner_config(args.config_path)
     config_accounts = config.selectel.additional_accounts
     secondary_config = config_accounts[0] if config_accounts else None
@@ -617,10 +720,15 @@ async def run_async(argv: list[str] | None = None) -> int:
             "ни второй (SEL2_* / additional_accounts[0])."
         )
 
+    _render_mode_banner(console, wp=wp, ws=ws)
+
+    # require_project=False: project может быть автодискавери-резолвнутым ниже
     if wp and not ws:
-        primary_settings = build_settings(args)
+        primary_settings = build_settings(args, require_project=False)
     else:
-        primary_settings = build_settings(args, allow_incomplete_primary=True)
+        primary_settings = build_settings(
+            args, allow_incomplete_primary=True, require_project=False
+        )
 
     primary_err: str | None = None
     if wp:
@@ -638,13 +746,20 @@ async def run_async(argv: list[str] | None = None) -> int:
             env_hint_primary=False,
         )
 
-    console = dashboard_console()
     interactive_ui = bool(args.rich) or (console.is_terminal and sys.stdout.isatty())
 
     # Один заданный аккаунт — один процесс сканера с обычным Rich-дашбордом.
     if wp and not ws:
         if primary_err:
             raise ValueError(primary_err)
+        await _bootstrap_account(
+            primary_settings,
+            console=console,
+            args=args,
+            account_label="Аккаунт 1",
+            env_prefix="SEL_",
+            interactive_ui=interactive_ui,
+        )
         await _prepare_primary_regions(args, primary_settings)
         return await _run_single_scanner_from_dual(
             primary_settings,
@@ -656,6 +771,17 @@ async def run_async(argv: list[str] | None = None) -> int:
     if ws and not wp:
         if secondary_err:
             raise ValueError(secondary_err)
+        secondary_seed = _build_secondary_settings(
+            primary_settings, regions=(), config_account=secondary_config
+        )
+        await _bootstrap_account(
+            secondary_seed,
+            console=console,
+            args=args,
+            account_label="Аккаунт 2",
+            env_prefix="SEL2_",
+            interactive_ui=interactive_ui,
+        )
         secondary_settings = await _finalize_secondary_settings(
             args,
             primary_settings,
@@ -673,10 +799,29 @@ async def run_async(argv: list[str] | None = None) -> int:
     assert wp and ws
     primary_regions: tuple[str, ...] | None = None
     if not primary_err:
+        await _bootstrap_account(
+            primary_settings,
+            console=console,
+            args=args,
+            account_label="Аккаунт 1",
+            env_prefix="SEL_",
+            interactive_ui=interactive_ui,
+        )
         primary_regions = await _prepare_primary_regions(args, primary_settings)
 
     secondary_settings: ScannerSettings | None = None
     if not secondary_err:
+        secondary_seed = _build_secondary_settings(
+            primary_settings, regions=(), config_account=secondary_config
+        )
+        await _bootstrap_account(
+            secondary_seed,
+            console=console,
+            args=args,
+            account_label="Аккаунт 2",
+            env_prefix="SEL2_",
+            interactive_ui=interactive_ui,
+        )
         secondary_settings = await _finalize_secondary_settings(
             args,
             primary_settings,

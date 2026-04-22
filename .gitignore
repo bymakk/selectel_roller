@@ -1,48 +1,47 @@
-# Configuration & Credentials
+# ── Секреты и локальная конфигурация ──────────────────────────────────────────
+.env
 config.json
 *.json
 !version.json
 
-# Logs
+# ── Логи ──────────────────────────────────────────────────────────────────────
 *.log
 app_rolling.log
 
-# Private keys (common naming patterns)
+# ── Ключи / сертификаты ───────────────────────────────────────────────────────
 *_key.json
 sa_key.json
 authorized_key.json
 *.pem
 *.key
 
-# Python / Environment
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+.pytest_cache/
+.coverage
+.tox/
+.hypothesis/
+
+# ── Виртуальные окружения ─────────────────────────────────────────────────────
 env/
 venv/
 .env
-.venv
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
+.venv/
 
-# Local folders
-source/
+# ── Временные данные (runtime) ────────────────────────────────────────────────
 temp/
 tmp/
+
+# ── Сборка ────────────────────────────────────────────────────────────────────
 dist/
 build/
 *.egg-info/
+source/
 
-# OS specific
+# ── ОС ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

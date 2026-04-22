@@ -7,6 +7,13 @@ SOFT_BACKOFF_SCALE = 0.5
 # Нижняя граница шага soft-backoff (пустой ответ / дубликаты); с батчем 1 IP допустима короче, чем для пачек
 SOFT_BACKOFF_MIN_SECONDS = 0.5
 
+# Минимальный кулдаун для HTTP 4xx (quota/rate-limit от Selectel): не менее этого значения.
+# 400 Bad Request на /floatingips — признак исчерпания квоты или rate-limit окна;
+# короткие retry только усугубляют ситуацию и мусорят в логе.
+HTTP_4XX_COOLDOWN_MIN = 30.0
+# Для 429 Too Many Requests — ещё длиннее, Selectel обычно сбрасывает окно за 60 с.
+HTTP_429_COOLDOWN_MIN = 60.0
+
 
 def apply_batch_result(
     state: RegionRunState,
@@ -70,14 +77,44 @@ def apply_error(
     min_batch_size: int,
     cooldown_base: float,
     cooldown_max: float,
+    http_status: int | None = None,
 ) -> float:
+    """Применяет штраф за ошибку запроса.
+
+    При HTTP 4xx (quota / rate-limit Selectel) кулдаун значительно длиннее, чем
+    при сетевых ошибках — иначе повторные быстрые попытки только мусорят в логе
+    и не дают Selectel сбросить окно ограничений.
+
+    http_status — код HTTP-ответа, если ошибка сетевая (None для CancelledError,
+    TimeoutError и т.п.).
+    """
     state.errors += 1
     state.last_error = error_message
     state.last_result = "error"
     state.consecutive_matches = 0
     state.consecutive_misses += 1
     state.batch_size = max(min_batch_size, state.batch_size // 2)
-    state.backoff_seconds = _next_backoff(state.backoff_seconds, cooldown_base, cooldown_max)
+
+    if http_status == 429:
+        # 429 Too Many Requests — Selectel явно говорит «подожди»
+        floor = HTTP_429_COOLDOWN_MIN
+        effective_max = max(cooldown_max, floor)
+        state.backoff_seconds = max(
+            floor,
+            _next_backoff(state.backoff_seconds, floor, effective_max),
+        )
+    elif http_status is not None and 400 <= http_status < 500:
+        # 400 / 403 / 409 и пр. 4xx — quota-like: нужна длинная пауза
+        floor = HTTP_4XX_COOLDOWN_MIN
+        effective_max = max(cooldown_max, floor)
+        state.backoff_seconds = max(
+            floor,
+            _next_backoff(state.backoff_seconds, floor, effective_max),
+        )
+    else:
+        # Сетевые ошибки (таймаут, разрыв соединения) — обычный backoff
+        state.backoff_seconds = _next_backoff(state.backoff_seconds, cooldown_base, cooldown_max)
+
     return state.backoff_seconds
 
 

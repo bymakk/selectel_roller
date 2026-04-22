@@ -34,6 +34,25 @@ from .strategy import apply_batch_result, apply_error
 from .whitelist import DEFAULT_WHITELIST_PATH, WhitelistMatcher
 
 
+def _extract_http_status(exc: BaseException) -> int | None:
+    """Пытается извлечь HTTP-статус из исключения httpx."""
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            return int(exc.response.status_code)
+    except Exception:
+        pass
+    # httpx иногда оборачивает статус в строку сообщения: "… '400 Bad Request' …"
+    msg = str(exc)
+    import re
+
+    m = re.search(r"\b([1-5]\d{2})\b", msg)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def _ip_list(records: list[FloatingIPRecord], *, limit: int = 12) -> str:
     """Строка адресов для логов; при длинном списке обрезает хвост."""
     if not records:
@@ -707,15 +726,24 @@ class SelectelScannerApp:
             except Exception as exc:
                 state.inflight = 0
                 error_message = str(exc).strip() or type(exc).__name__
+                http_status = _extract_http_status(exc)
                 cooldown = apply_error(
                     state,
                     error_message=error_message,
                     min_batch_size=self.settings.min_batch_size,
                     cooldown_base=self.settings.cooldown_base,
                     cooldown_max=self.settings.cooldown_max,
+                    http_status=http_status,
                 )
                 state.cooldown_until = time.monotonic() + cooldown if cooldown > 0 else 0.0
-                self.log("error", f"[{region}] Ошибка: {error_message}")
+                status_hint = f" [HTTP {http_status}]" if http_status else ""
+                self.log("error", f"[{region}] Ошибка{status_hint}: {error_message}")
+                if http_status and 400 <= http_status < 500:
+                    self.log(
+                        "warning",
+                        f"[{region}] HTTP {http_status} — кулдаун {cooldown:.0f}s "
+                        f"(quota/rate-limit Selectel)",
+                    )
                 try:
                     await self._reconcile_unbound_non_matches(reason="error", regions={region})
                 except Exception as reconcile_exc:
@@ -947,10 +975,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cooldown-base",
         type=float,
-        default=1.2,
-        help="Базовая пауза при пустом ответе / ошибке (сек; под батч 1 IP ниже, чем для пачек)",
+        default=2.0,
+        help="Базовая пауза при пустом ответе (сек). HTTP 4xx всегда даёт минимум 30 с независимо от этого значения.",
     )
-    parser.add_argument("--cooldown-max", type=float, default=15.0)
+    parser.add_argument(
+        "--cooldown-max",
+        type=float,
+        default=60.0,
+        help="Максимальный кулдаун (сек). При HTTP 4xx/429 может временно превышать это значение.",
+    )
     parser.add_argument(
         "--reconcile-interval",
         type=float,

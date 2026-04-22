@@ -53,6 +53,45 @@ def _extract_http_status(exc: BaseException) -> int | None:
     return None
 
 
+def _compact_error(exc: BaseException) -> str:
+    """Возвращает короткое, однострочное описание ошибки для UI.
+
+    httpx.HTTPStatusError разворачивается в «HTTP 400 /v2.0/floatingips».
+    Длинные строки обрезаются до 80 символов, ссылки на MDN убираются.
+    """
+    import re
+
+    try:
+        import httpx
+
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            status = exc.response.status_code
+            # Берём только последний сегмент пути без query: /v2.0/floatingips
+            url = str(exc.request.url) if exc.request else ""
+            try:
+                from urllib.parse import urlparse
+
+                path = urlparse(url).path.rstrip("/") or url
+                # оставим последние 2 сегмента: /v2.0/floatingips
+                parts = [p for p in path.split("/") if p]
+                short_path = "/" + "/".join(parts[-2:]) if parts else path
+            except Exception:
+                short_path = url[:40]
+            return f"HTTP {status} {short_path}"
+    except Exception:
+        pass
+
+    msg = str(exc).strip() or type(exc).__name__
+    # Убираем «For more information check: https://...» которую httpx добавляет
+    msg = re.sub(r"\s*For more information check:.*$", "", msg, flags=re.DOTALL).strip()
+    # Убираем полные URL — оставляем только путь
+    msg = re.sub(r"https?://[^\s'\"]+\.selcloud\.ru(/[^\s'\"]*)", r"\1", msg)
+    # Схлопываем переносы строк и лишние пробелы в один пробел
+    msg = re.sub(r"\s+", " ", msg).strip()
+    # Обрезаем до 80 символов
+    return msg[:80] + "…" if len(msg) > 80 else msg
+
+
 def _ip_list(records: list[FloatingIPRecord], *, limit: int = 12) -> str:
     """Строка адресов для логов; при длинном списке обрезает хвост."""
     if not records:
@@ -725,7 +764,7 @@ class SelectelScannerApp:
                 raise
             except Exception as exc:
                 state.inflight = 0
-                error_message = str(exc).strip() or type(exc).__name__
+                error_message = _compact_error(exc)
                 http_status = _extract_http_status(exc)
                 cooldown = apply_error(
                     state,
@@ -736,13 +775,11 @@ class SelectelScannerApp:
                     http_status=http_status,
                 )
                 state.cooldown_until = time.monotonic() + cooldown if cooldown > 0 else 0.0
-                status_hint = f" [HTTP {http_status}]" if http_status else ""
-                self.log("error", f"[{region}] Ошибка{status_hint}: {error_message}")
+                self.log("error", f"[{region}] {error_message}")
                 if http_status and 400 <= http_status < 500:
                     self.log(
                         "warning",
-                        f"[{region}] HTTP {http_status} — кулдаун {cooldown:.0f}s "
-                        f"(quota/rate-limit Selectel)",
+                        f"[{region}] HTTP {http_status} → пауза {cooldown:.0f}s",
                     )
                 try:
                     await self._reconcile_unbound_non_matches(reason="error", regions={region})
